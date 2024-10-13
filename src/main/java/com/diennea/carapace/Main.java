@@ -1,7 +1,7 @@
 package com.diennea.carapace;
 
 import io.netty.handler.logging.LogLevel;
-import reactor.core.publisher.Hooks;
+import java.util.function.Function;
 import reactor.core.publisher.Mono;
 import reactor.netty.DisposableServer;
 import reactor.netty.http.HttpProtocol;
@@ -25,6 +25,7 @@ public class Main {
                 .host(HOST)
                 .port(PORT)
                 .protocol(HttpProtocol.H2C)
+                .metrics(true, Function.identity())
                 .wiretap(HttpServer.class.getName(), LogLevel.INFO, AdvancedByteBufFormat.HEX_DUMP)
                 .handle((request, response) -> response.sendString(Mono.just("Hello from server")));
         final DisposableServer server = httpServer.bindNow();
@@ -34,6 +35,7 @@ public class Main {
                 .host(HOST)
                 .port(PORT)
                 .protocol(HttpProtocol.H2C)
+                .metrics(true, Function.identity())
                 .wiretap(HttpClient.class.getName(), LogLevel.INFO, AdvancedByteBufFormat.HEX_DUMP);
 
         client.get()

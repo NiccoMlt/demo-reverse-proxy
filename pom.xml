@@ -48,6 +48,13 @@
             <artifactId>netty-tcnative-boringssl-static</artifactId>
             <version>2.0.66.Final</version>
         </dependency>
+
+        <!-- https://docs.micrometer.io/micrometer/reference/installing.html -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+            <version>1.13.5</version>
+        </dependency>
     </dependencies>
 
 </project>
