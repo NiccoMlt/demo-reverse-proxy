@@ -39,7 +39,15 @@ public class Main {
                 .wiretap(HttpClient.class.getName(), LogLevel.INFO, AdvancedByteBufFormat.HEX_DUMP);
 
         client.get()
-                .response()
+                .responseSingle((response, byteBufMono) -> {
+                    if (response.status().code() < 200 || response.status().code() >= 300) {
+                        return Mono.error(new RuntimeException("Server response: " + response.status()));
+                    }
+                    return byteBufMono.asString();
+                })
+                .doOnError(error -> {
+                    throw new RuntimeException(error);
+                })
                 .doFinally(signalType -> server.disposeNow())
                 .block();
     }
