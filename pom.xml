@@ -36,6 +36,12 @@
             <artifactId>reactor-netty-http</artifactId>
         </dependency>
 
+        <!-- https://projectreactor.io/docs/core/release/reference/#reactor-tools-debug -->
+        <dependency>
+            <groupId>io.projectreactor</groupId>
+            <artifactId>reactor-tools</artifactId>
+        </dependency>
+
         <!-- https://netty.io/wiki/forked-tomcat-native.html -->
         <dependency>
             <groupId>io.netty</groupId>
