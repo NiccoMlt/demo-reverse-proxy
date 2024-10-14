@@ -3,9 +3,11 @@ package com.diennea.carapace;
 import io.netty.handler.ssl.ApplicationProtocolConfig;
 import io.netty.handler.ssl.ApplicationProtocolNames;
 import io.netty.handler.ssl.OpenSsl;
+import io.netty.handler.ssl.ReferenceCountedOpenSslEngine;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslProvider;
+import io.netty.util.AttributeKey;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.net.URI;
@@ -314,7 +316,12 @@ public class Main {
                 .host(HOST)
                 .port(PORT)
                 .protocol(HttpProtocol.H2)
-                .secure(sslContextSpec -> sslContextSpec.sslContext(sslContext))
+                .secure(sslContextSpec -> sslContextSpec.sslContext(sslContext).handlerConfigurator(sslHandler -> {
+                    if (!(sslHandler.engine() instanceof ReferenceCountedOpenSslEngine engine)) {
+                        throw new RuntimeException("Unexpected SSL handler type: " + sslHandler.engine());
+                    }
+                    engine.setOcspResponse(/* todo: add OCSP response from somewhere */null);
+                }))
                 // .wiretap(HttpServer.class.getName(), LogLevel.INFO, AdvancedByteBufFormat.HEX_DUMP)
                 .metrics(true, Function.identity())
                 .handle((final HttpServerRequest request, final HttpServerResponse response) -> {
