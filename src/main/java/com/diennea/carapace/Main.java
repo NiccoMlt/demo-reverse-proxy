@@ -2,8 +2,11 @@ package com.diennea.carapace;
 
 import io.netty.handler.codec.http.HttpStatusClass;
 import io.netty.handler.codec.http.HttpVersion;
-import io.netty.handler.logging.LogLevel;
+import io.netty.handler.ssl.ApplicationProtocolConfig;
+import io.netty.handler.ssl.ApplicationProtocolNames;
 import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.ssl.SslProvider;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.net.URI;
@@ -39,12 +42,10 @@ import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import reactor.core.publisher.Mono;
 import reactor.netty.DisposableServer;
-import reactor.netty.http.Http2SslContextSpec;
 import reactor.netty.http.HttpProtocol;
 import reactor.netty.http.server.HttpServer;
 import reactor.netty.http.server.HttpServerRequest;
 import reactor.netty.http.server.HttpServerResponse;
-import reactor.netty.transport.logging.AdvancedByteBufFormat;
 import reactor.tools.agent.ReactorDebugAgent;
 
 import java.net.http.HttpClient;
@@ -55,7 +56,7 @@ public class Main {
     private static final String JCA_PROVIDER = BouncyCastleProvider.PROVIDER_NAME;
     private static final String JSSE_PROVIDER = BouncyCastleJsseProvider.PROVIDER_NAME;
     private static final String HOST = "localhost";
-    private static final int PORT = 8080;
+    private static final int PORT = 8443;
     private static final String KEYSTORE_TYPE = "PKCS12";
     private static final String KEY_ALGORITHM = "RSA";
     private static final String KEY_MANAGER_ALGORITHM = "PKIX";
@@ -82,7 +83,9 @@ public class Main {
         try (final HttpClient client = setupHttpClient(rootCa)) {
             final HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create("https://" + HOST + ":" + PORT))
+                    .version(HttpClient.Version.HTTP_2)
                     .GET()
+                    .version(HttpClient.Version.HTTP_2)
                     .build();
 
             final HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
@@ -158,9 +161,20 @@ public class Main {
         final KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KEY_MANAGER_ALGORITHM, JSSE_PROVIDER);
         keyManagerFactory.init(keyStore, null);
 
-        final SslContext sslContext = Http2SslContextSpec
+        final SslContext sslContext = SslContextBuilder
                 .forServer(keyManagerFactory)
-                .sslContext();
+                .sslProvider(SslProvider.OPENSSL)
+                .applicationProtocolConfig(new ApplicationProtocolConfig(
+                        // Use ALPN for negotiation
+                        ApplicationProtocolConfig.Protocol.ALPN,
+                        // Do not advertise if no match
+                        ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
+                        // Accept if no protocol is selected
+                        ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
+                        // Advertise only HTTP/2, do not fall back to HTTP/1.1
+                        ApplicationProtocolNames.HTTP_2
+                ))
+                .build();
 
         final HttpServer httpServer = HttpServer
                 .create()
