@@ -25,8 +25,11 @@ import java.security.UnrecoverableKeyException;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.util.Date;
+import java.util.List;
 import java.util.function.Function;
+import javax.net.ssl.ExtendedSSLSession;
 import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLSession;
 import javax.net.ssl.TrustManagerFactory;
 import org.bouncycastle.asn1.DERUTF8String;
 import org.bouncycastle.asn1.x500.X500Name;
@@ -94,6 +97,15 @@ public class Main {
 
             if (!HttpStatusClass.SUCCESS.contains(response.statusCode())) {
                 throw new RuntimeException("Server response: " + response.statusCode());
+            }
+
+            final SSLSession sslSession = response.sslSession().orElseThrow();
+            if (!(sslSession instanceof ExtendedSSLSession extendedSSLSession)) {
+                throw new RuntimeException("SSL Session of unexpected type: " + sslSession);
+            }
+            final List<byte[]> statusResponses = extendedSSLSession.getStatusResponses();
+            if (statusResponses == null || statusResponses.isEmpty()) {
+                throw new RuntimeException("OCSP response missing.");
             }
 
             System.out.println("Server response: " + response.body());
@@ -168,6 +180,7 @@ public class Main {
                         ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
                         ApplicationProtocolNames.HTTP_2
                 ))
+                .enableOcsp(true)
                 .build();
 
         final HttpServer httpServer = HttpServer
@@ -195,6 +208,8 @@ public class Main {
 
         final TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(KEY_MANAGER_ALGORITHM, JSSE_PROVIDER);
         trustManagerFactory.init(trustStore);
+
+        Security.setProperty("ocsp.enable", "true");
 
         final SSLContext sslContext = SSLContext.getInstance(SSL_CONTEXT_ALGORITHM, JSSE_PROVIDER);
         sslContext.init(null, trustManagerFactory.getTrustManagers(), null);
