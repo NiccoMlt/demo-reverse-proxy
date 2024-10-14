@@ -1,6 +1,5 @@
 package com.diennea.carapace;
 
-import io.netty.handler.codec.http.HttpStatusClass;
 import io.netty.handler.ssl.ApplicationProtocolConfig;
 import io.netty.handler.ssl.ApplicationProtocolNames;
 import io.netty.handler.ssl.SslContext;
@@ -19,16 +18,14 @@ import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
 import java.security.NoSuchProviderException;
 import java.security.PrivateKey;
+import java.security.SecureRandom;
 import java.security.Security;
 import java.security.UnrecoverableKeyException;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.util.Date;
-import java.util.List;
 import java.util.function.Function;
-import javax.net.ssl.ExtendedSSLSession;
 import javax.net.ssl.KeyManagerFactory;
-import javax.net.ssl.SSLSession;
 import javax.net.ssl.TrustManagerFactory;
 import org.bouncycastle.asn1.DERUTF8String;
 import org.bouncycastle.asn1.x500.X500Name;
@@ -75,6 +72,7 @@ public class Main {
         System.setProperty("jdk.tls.client.enableStatusRequestExtension", "true"); // Enable OCSP stapling on the client
         System.setProperty("com.sun.net.ssl.checkRevocation", "true"); // Enable revocation checking; alternative to PKIXParameters#setRevocationEnabled
 
+        // System.setProperty("javax.net.debug", "all");
         ReactorDebugAgent.init();
     }
 
@@ -96,7 +94,7 @@ public class Main {
 
             final HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
 
-            if (response.version() != HttpClient.Version.HTTP_2) {
+            /* if (response.version() != HttpClient.Version.HTTP_2) {
                 throw new RuntimeException("Server response protocol: " + response.version());
             }
 
@@ -112,7 +110,7 @@ public class Main {
             final List<byte[]> statusResponses = extendedSSLSession.getStatusResponses();
             if (statusResponses == null || statusResponses.isEmpty()) {
                 throw new RuntimeException("OCSP response missing.");
-            }
+            } */
 
             System.out.println("Server response: " + response.body());
 
