@@ -53,7 +53,7 @@ public class Main {
     private static final String JCA_PROVIDER = BouncyCastleProvider.PROVIDER_NAME;
     private static final String JSSE_PROVIDER = BouncyCastleJsseProvider.PROVIDER_NAME;
     private static final String HOST = "localhost";
-    private static final int PORT = 8080;
+    private static final int PORT = 8443;
     private static final String KEYSTORE_TYPE = "PKCS12";
     private static final String KEY_ALGORITHM = "RSA";
     private static final SslProvider SSL_PROVIDER = SslProvider.OPENSSL;
@@ -153,6 +153,7 @@ public class Main {
 
         final SslContext sslContext = SslContextBuilder.forServer(keyManagerFactory)
                 .sslProvider(SSL_PROVIDER)
+                .enableOcsp(true)
                 .build();
 
         final HttpServer httpServer = HttpServer
@@ -180,6 +181,7 @@ public class Main {
         final SslContext sslContext = SslContextBuilder.forClient()
                 .trustManager(trustManagerFactory)
                 .sslProvider(SSL_PROVIDER)
+                .enableOcsp(true)
                 .build();
 
         return HttpClient
