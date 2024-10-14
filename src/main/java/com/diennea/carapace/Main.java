@@ -83,9 +83,7 @@ public class Main {
         try (final HttpClient client = setupHttpClient(rootCa)) {
             final HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create("https://" + HOST + ":" + PORT))
-                    .version(HttpClient.Version.HTTP_2)
                     .GET()
-                    .version(HttpClient.Version.HTTP_2)
                     .build();
 
             final HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
@@ -165,13 +163,9 @@ public class Main {
                 .forServer(keyManagerFactory)
                 .sslProvider(SslProvider.OPENSSL)
                 .applicationProtocolConfig(new ApplicationProtocolConfig(
-                        // Use ALPN for negotiation
                         ApplicationProtocolConfig.Protocol.ALPN,
-                        // Do not advertise if no match
                         ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
-                        // Accept if no protocol is selected
                         ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
-                        // Advertise only HTTP/2, do not fall back to HTTP/1.1
                         ApplicationProtocolNames.HTTP_2
                 ))
                 .build();
@@ -185,9 +179,10 @@ public class Main {
                 // .wiretap(HttpServer.class.getName(), LogLevel.INFO, AdvancedByteBufFormat.HEX_DUMP)
                 .metrics(true, Function.identity())
                 .handle((final HttpServerRequest request, final HttpServerResponse response) -> {
-                    if (HttpVersion.valueOf(request.protocol()).majorVersion() != 2) {
+                    // we can't check request.protocol() here, it will always be HTTP/1.1 !!!
+                    /* if (HttpVersion.valueOf(request.protocol()).majorVersion() != 2) {
                         throw new RuntimeException("Unsupported HTTP version: " + request.protocol());
-                    }
+                    } */
                     return response.sendString(Mono.just("Hello from server"));
                 });
         return httpServer.bindNow();
