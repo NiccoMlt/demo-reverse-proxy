@@ -1,7 +1,6 @@
 package com.diennea.carapace;
 
 import io.netty.handler.codec.http.HttpStatusClass;
-import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.ssl.ApplicationProtocolConfig;
 import io.netty.handler.ssl.ApplicationProtocolNames;
 import io.netty.handler.ssl.SslContext;
@@ -70,6 +69,12 @@ public class Main {
     static {
         Security.insertProviderAt(new BouncyCastleProvider(), 1);
         Security.insertProviderAt(new BouncyCastleJsseProvider(), 2);
+
+        // https://docs.oracle.com/en/java/javase/21/security/java-secure-socket-extension-jsse-reference-guide.html
+        Security.setProperty("ocsp.enable", "true"); // Enable client-driven OCSP
+        System.setProperty("jdk.tls.client.enableStatusRequestExtension", "true"); // Enable OCSP stapling on the client
+        System.setProperty("com.sun.net.ssl.checkRevocation", "true"); // Enable revocation checking; alternative to PKIXParameters#setRevocationEnabled
+
         ReactorDebugAgent.init();
     }
 
@@ -103,6 +108,7 @@ public class Main {
             if (!(sslSession instanceof ExtendedSSLSession extendedSSLSession)) {
                 throw new RuntimeException("SSL Session of unexpected type: " + sslSession);
             }
+            // The OCSP response is encoded using the Distinguished Encoding Rules (DER) in a format described by the ASN.1 found in RFC 6960
             final List<byte[]> statusResponses = extendedSSLSession.getStatusResponses();
             if (statusResponses == null || statusResponses.isEmpty()) {
                 throw new RuntimeException("OCSP response missing.");
@@ -208,8 +214,6 @@ public class Main {
 
         final TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(KEY_MANAGER_ALGORITHM, JSSE_PROVIDER);
         trustManagerFactory.init(trustStore);
-
-        Security.setProperty("ocsp.enable", "true");
 
         final SSLContext sslContext = SSLContext.getInstance(SSL_CONTEXT_ALGORITHM, JSSE_PROVIDER);
         sslContext.init(null, trustManagerFactory.getTrustManagers(), null);
