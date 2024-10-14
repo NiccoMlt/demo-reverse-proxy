@@ -8,7 +8,10 @@ import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslProvider;
 import java.io.IOException;
 import java.math.BigInteger;
+import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.security.KeyManagementException;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
@@ -20,12 +23,16 @@ import java.security.PrivateKey;
 import java.security.SecureRandom;
 import java.security.Security;
 import java.security.UnrecoverableKeyException;
+import java.security.cert.CertificateEncodingException;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.util.Date;
 import java.util.function.Function;
+import javax.net.ssl.ExtendedSSLSession;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLHandshakeException;
+import javax.net.ssl.SSLSession;
 import javax.net.ssl.TrustManagerFactory;
 import org.bouncycastle.asn1.DERUTF8String;
 import org.bouncycastle.asn1.x500.X500Name;
@@ -45,10 +52,13 @@ import org.bouncycastle.cert.ocsp.CertificateID;
 import org.bouncycastle.cert.ocsp.CertificateStatus;
 import org.bouncycastle.cert.ocsp.OCSPException;
 import org.bouncycastle.cert.ocsp.OCSPReq;
+import org.bouncycastle.cert.ocsp.OCSPReqBuilder;
+import org.bouncycastle.cert.ocsp.OCSPResp;
 import org.bouncycastle.cert.ocsp.OCSPRespBuilder;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.jsse.provider.BouncyCastleJsseProvider;
 import org.bouncycastle.operator.ContentSigner;
+import org.bouncycastle.operator.DigestCalculator;
 import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.bouncycastle.operator.jcajce.JcaDigestCalculatorProviderBuilder;
@@ -95,15 +105,18 @@ public class Main {
         }
     }
 
-    public static void main(final String... args)
-            throws NoSuchAlgorithmException, NoSuchProviderException, CertificateException, OperatorCreationException, UnrecoverableKeyException, KeyStoreException, IOException, InterruptedException, KeyManagementException {
+    public static void main(final String... args) throws Exception {
         final KeyPair rootKeyPair = generateKeyPair();
         final X509Certificate rootCa = buildRootCertificationAuthority(rootKeyPair);
 
         final KeyPair keyPair = generateKeyPair();
         final X509Certificate httpsCertificate = buildHttpsCertificate(keyPair, rootCa, rootKeyPair.getPrivate());
 
+        // Start OCSP Responder
         final DisposableServer ocspResponder = setupOcspResponder(rootCa, rootKeyPair);
+
+        // Send OCSP request and verify the certificate status
+        verifyCertificateWithOCSP(rootCa, httpsCertificate);
 
         ocspResponder.onDispose().block();
 
@@ -141,6 +154,64 @@ public class Main {
 
             server.disposeNow();
         } */
+    }
+
+    // Generates an OCSP request for the provided certificate
+    private static OCSPReq generateOCSPRequest(
+            final X509Certificate issuerCert, final X509Certificate clientCert
+    ) throws OperatorCreationException, CertificateEncodingException, IOException, OCSPException {
+        final var digestCalculator = new JcaDigestCalculatorProviderBuilder().build().get(CertificateID.HASH_SHA1);
+        final CertificateID certificateID = new CertificateID(
+                digestCalculator, new X509CertificateHolder(issuerCert.getEncoded()), clientCert.getSerialNumber()
+        );
+        final OCSPReqBuilder ocspReqBuilder = new OCSPReqBuilder();
+        ocspReqBuilder.addRequest(certificateID);
+        return ocspReqBuilder.build();
+    }
+
+    // Send OCSP request and get the response from the OCSP server
+    private static OCSPResp sendOCSPRequest(
+            final URI ocspUri, final byte[] ocspRequestBytes
+    ) throws IOException, InterruptedException {
+        try (HttpClient httpClient = HttpClient.newHttpClient()) {
+            final HttpRequest request = HttpRequest.newBuilder()
+                    .uri(ocspUri)
+                    .header("Content-Type", "application/ocsp-request")
+                    .POST(HttpRequest.BodyPublishers.ofByteArray(ocspRequestBytes))
+                    .build();
+            final HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
+            return new OCSPResp(response.body());
+        }
+    }
+
+    // Parse and check the OCSP response
+    private static void parseOCSPResponse(final OCSPResp ocspResp) throws OCSPException {
+        if (ocspResp.getStatus() != OCSPRespBuilder.SUCCESSFUL) {
+            throw new RuntimeException("OCSP response is not successful: " + ocspResp.getStatus());
+        }
+        final BasicOCSPResp basicResponse = (BasicOCSPResp) ocspResp.getResponseObject();
+        final CertificateStatus certStatus = basicResponse.getResponses()[0].getCertStatus();
+        if (certStatus == CertificateStatus.GOOD) {
+            System.out.println("The certificate is GOOD.");
+            return;
+        }
+        if (certStatus instanceof org.bouncycastle.cert.ocsp.RevokedStatus) {
+            System.out.println("The certificate is REVOKED.");
+            return;
+        }
+        throw new RuntimeException("The certificate status is UNKNOWN.");
+    }
+
+    private static void verifyCertificateWithOCSP(X509Certificate caCert, X509Certificate clientCert) throws OCSPException, IOException, InterruptedException, CertificateEncodingException, OperatorCreationException {
+        // Generate OCSP request
+        OCSPReq ocspRequest = generateOCSPRequest(caCert, clientCert);
+
+        // Send request to the OCSP responder
+        URI ocspUri = URI.create("http://localhost:8080/ocsp");
+        OCSPResp ocspResp = sendOCSPRequest(ocspUri, ocspRequest.getEncoded());
+
+        // Parse and validate the OCSP response
+        parseOCSPResponse(ocspResp);
     }
 
     private static KeyPair generateKeyPair() throws NoSuchAlgorithmException, NoSuchProviderException {
