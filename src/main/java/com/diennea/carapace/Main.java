@@ -95,6 +95,7 @@ public class Main {
         // https://docs.oracle.com/en/java/javase/21/security/java-secure-socket-extension-jsse-reference-guide.html
         Security.setProperty("ocsp.enable", "true"); // Enable client-driven OCSP
         System.setProperty("jdk.tls.client.enableStatusRequestExtension", "true"); // Enable OCSP stapling on the client
+        System.setProperty("jdk.tls.server.enableStatusRequestExtension", "true"); // Enable OCSP stapling on the server
         System.setProperty("com.sun.net.ssl.checkRevocation", "true"); // Enable revocation checking; alternative to PKIXParameters#setRevocationEnabled
 
         // System.setProperty("javax.net.debug", "all");
@@ -158,10 +159,13 @@ public class Main {
             if (!(sslSession instanceof ExtendedSSLSession extendedSSLSession)) {
                 throw new RuntimeException("SSL Session of unexpected type: " + sslSession);
             }
+
             // The OCSP response is encoded using the Distinguished Encoding Rules (DER) in a format described by the ASN.1 found in RFC 6960
             final List<byte[]> statusResponses = extendedSSLSession.getStatusResponses();
             if (statusResponses == null || statusResponses.isEmpty()) {
                 throw new RuntimeException("OCSP response missing.");
+            } else {
+                System.out.println("Received OCSP responses: " + statusResponses.size());
             }
 
             System.out.println("Server response: " + response.body());
@@ -268,20 +272,25 @@ public class Main {
                                                 .build()
                                                 .get(CertificateID.HASH_SHA1)
                                 );
+
+                                // Here, modify the status as needed (e.g., GOOD, REVOKED, etc.)
                                 responseBuilder.addResponse(certificateID, CertificateStatus.GOOD);
                                 final ContentSigner contentSigner = new JcaContentSignerBuilder("SHA256WithRSAEncryption")
                                         .setProvider(JCA_PROVIDER)
                                         .build(caKeyPair.getPrivate());
                                 final BasicOCSPResp basicResponse = responseBuilder.build(contentSigner, null, new Date());
+
                                 final OCSPRespBuilder ocspRespBuilder = new OCSPRespBuilder();
                                 final byte[] ocspResponseBytes = ocspRespBuilder
                                         .build(OCSPRespBuilder.SUCCESSFUL, basicResponse)
                                         .getEncoded();
+
                                 return response
                                         .header("Content-Type", "application/ocsp-response")
                                         .sendByteArray(Mono.just(ocspResponseBytes))
                                         .then();
                             } catch (IOException | OCSPException | OperatorCreationException e) {
+                                e.printStackTrace(); // Log the error for debugging
                                 return Mono.error(e);
                             }
                         })
@@ -324,15 +333,16 @@ public class Main {
                         throw new RuntimeException("Unexpected SSL handler type: " + sslHandler.engine());
                     }
 
-                    // Get the current OCSP response for the certificate
+                    // Attempt to retrieve and set the OCSP response here
                     try {
                         final byte[] ocspResponse = getOcspResponse(issuer, httpsCertificate);
-                        if (ocspResponse == null) {
-                            throw new RuntimeException("Failed to retrieve OCSP response.");
+                        if (ocspResponse != null) {
+                            engine.setOcspResponse(ocspResponse);
+                        } else {
+                            System.err.println("Failed to retrieve OCSP response. It is null.");
                         }
-                        engine.setOcspResponse(ocspResponse);
                     } catch (Exception e) {
-                        throw new RuntimeException(e);
+                        throw new RuntimeException("Failed to set OCSP response: " + e.getMessage(), e);
                     }
                 }))
                 .metrics(true, Function.identity())
