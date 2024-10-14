@@ -12,6 +12,8 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.security.KeyManagementException;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
@@ -26,14 +28,13 @@ import java.security.UnrecoverableKeyException;
 import java.security.cert.CertificateEncodingException;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
+import java.util.Base64;
 import java.util.Date;
 import java.util.function.Function;
-import javax.net.ssl.ExtendedSSLSession;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLHandshakeException;
-import javax.net.ssl.SSLSession;
 import javax.net.ssl.TrustManagerFactory;
+import org.bouncycastle.asn1.DERSequence;
 import org.bouncycastle.asn1.DERUTF8String;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x500.X500NameBuilder;
@@ -58,7 +59,6 @@ import org.bouncycastle.cert.ocsp.OCSPRespBuilder;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.jsse.provider.BouncyCastleJsseProvider;
 import org.bouncycastle.operator.ContentSigner;
-import org.bouncycastle.operator.DigestCalculator;
 import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.bouncycastle.operator.jcajce.JcaDigestCalculatorProviderBuilder;
@@ -106,23 +106,33 @@ public class Main {
     }
 
     public static void main(final String... args) throws Exception {
+        // Generate a root self-signed certificate that acts as a CA...
         final KeyPair rootKeyPair = generateKeyPair();
         final X509Certificate rootCa = buildRootCertificationAuthority(rootKeyPair);
 
+        // Save the root CA certificate to a file
+        saveCertificateToFile(rootCa, "rootCA.crt");
+
+        // ... and generate an HTTPS certificate signed by the CA
         final KeyPair keyPair = generateKeyPair();
         final X509Certificate httpsCertificate = buildHttpsCertificate(keyPair, rootCa, rootKeyPair.getPrivate());
 
+        // Save the HTTPS certificate to a file
+        saveCertificateToFile(httpsCertificate, "httpsCertificate.crt");
+
         // Start OCSP Responder
-        final DisposableServer ocspResponder = setupOcspResponder(rootCa, rootKeyPair);
+        final DisposableServer ocspResponder = setupOcspResponder(rootKeyPair);
 
         // Send OCSP request and verify the certificate status
         verifyCertificateWithOCSP(rootCa, httpsCertificate);
 
-        ocspResponder.onDispose().block();
+//        ocspResponder.onDispose().block();
 
-        /* final DisposableServer server = setupHttpServer(httpsCertificate, keyPair.getPrivate());
+        final DisposableServer server = setupHttpServer(httpsCertificate, keyPair.getPrivate());
 
-        server.onDispose().block(); */
+//        server.onDispose().block();
+
+        Mono.when(ocspResponder.onDispose(), server.onDispose()).block();
 
         /* try (final HttpClient client = setupHttpClient(rootCa)) {
             final HttpRequest request = HttpRequest.newBuilder()
@@ -154,6 +164,14 @@ public class Main {
 
             server.disposeNow();
         } */
+    }
+
+    private static void saveCertificateToFile(X509Certificate certificate, String filename) throws IOException, CertificateEncodingException {
+        String pem = "-----BEGIN CERTIFICATE-----\n"
+                     + Base64.getEncoder().encodeToString(certificate.getEncoded())
+                     + "\n-----END CERTIFICATE-----\n";
+        Files.write(Paths.get(filename), pem.getBytes());
+        System.out.println("Saved certificate to " + filename);
     }
 
     // Generates an OCSP request for the provided certificate
@@ -253,7 +271,7 @@ public class Main {
 
     private static X509Certificate buildHttpsCertificate(
             final KeyPair keyPair, final X509Certificate rootCa, final PrivateKey rootPrivateKey
-    ) throws OperatorCreationException, CertificateException {
+    ) throws OperatorCreationException, CertificateException, IOException {
         final long now = System.currentTimeMillis();
         final JcaX509v3CertificateBuilder x509CertificateBuilder = new JcaX509v3CertificateBuilder(
                 rootCa,
@@ -263,6 +281,22 @@ public class Main {
                 new X500NameBuilder().addRDN(BCStyle.CN, HOST).build(),
                 keyPair.getPublic()
         );
+
+        // Add the AIA extension with the OCSP responder URI
+        final Extension aiaExtension = new Extension(
+                Extension.authorityInfoAccess,
+                false, // extension is not critical
+                new DERSequence(new org.bouncycastle.asn1.x509.AccessDescription(
+                        org.bouncycastle.asn1.x509.AccessDescription.id_ad_ocsp,
+                        new org.bouncycastle.asn1.x509.GeneralName(
+                                org.bouncycastle.asn1.x509.GeneralName.uniformResourceIdentifier,
+                                "http://localhost:8080/ocsp" // OCSP responder URI
+                        )
+                )).getEncoded()
+        );
+
+        x509CertificateBuilder.addExtension(aiaExtension);
+
         final ContentSigner contentSigner = new JcaContentSignerBuilder(CERT_ALGORITHM)
                 .setProvider(JCA_PROVIDER)
                 .build(rootPrivateKey);
@@ -335,7 +369,7 @@ public class Main {
                 .build();
     }
 
-    private static DisposableServer setupOcspResponder(final X509Certificate caCert, final KeyPair caKeyPair) {
+    private static DisposableServer setupOcspResponder(final KeyPair caKeyPair) {
         return HttpServer.create()
                 .host(HOST)
                 .port(OCSP_PORT)
