@@ -1,13 +1,15 @@
 package com.diennea.carapace;
 
-import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpStatusClass;
+import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.logging.LogLevel;
 import io.netty.handler.ssl.SslContext;
-import io.netty.handler.ssl.SslContextBuilder;
-import io.netty.handler.ssl.SslProvider;
 import java.io.IOException;
 import java.math.BigInteger;
+import java.net.URI;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.security.KeyManagementException;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
@@ -36,30 +38,30 @@ import org.bouncycastle.operator.ContentSigner;
 import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import reactor.core.publisher.Mono;
-import reactor.core.publisher.SignalType;
-import reactor.netty.ByteBufMono;
 import reactor.netty.DisposableServer;
+import reactor.netty.http.Http2SslContextSpec;
 import reactor.netty.http.HttpProtocol;
-import reactor.netty.http.client.HttpClient;
-import reactor.netty.http.client.HttpClientResponse;
 import reactor.netty.http.server.HttpServer;
 import reactor.netty.http.server.HttpServerRequest;
 import reactor.netty.http.server.HttpServerResponse;
 import reactor.netty.transport.logging.AdvancedByteBufFormat;
 import reactor.tools.agent.ReactorDebugAgent;
 
+import java.net.http.HttpClient;
+import javax.net.ssl.SSLContext;
+
 public class Main {
 
     private static final String JCA_PROVIDER = BouncyCastleProvider.PROVIDER_NAME;
     private static final String JSSE_PROVIDER = BouncyCastleJsseProvider.PROVIDER_NAME;
     private static final String HOST = "localhost";
-    private static final int PORT = 8443;
+    private static final int PORT = 8080;
     private static final String KEYSTORE_TYPE = "PKCS12";
     private static final String KEY_ALGORITHM = "RSA";
-    private static final SslProvider SSL_PROVIDER = SslProvider.OPENSSL;
     private static final String KEY_MANAGER_ALGORITHM = "PKIX";
     private static final String HASH_ALGORITHM = "SHA256";
     private static final String CERT_ALGORITHM = HASH_ALGORITHM + "with" + KEY_ALGORITHM;
+    private static final String SSL_CONTEXT_ALGORITHM = "TLS";
 
     static {
         Security.insertProviderAt(new BouncyCastleProvider(), 1);
@@ -68,8 +70,7 @@ public class Main {
     }
 
     public static void main(final String... args)
-            throws NoSuchAlgorithmException, NoSuchProviderException, CertificateException, OperatorCreationException,
-            KeyStoreException, IOException, UnrecoverableKeyException {
+            throws NoSuchAlgorithmException, NoSuchProviderException, CertificateException, OperatorCreationException, UnrecoverableKeyException, KeyStoreException, IOException, InterruptedException, KeyManagementException {
         final KeyPair rootKeyPair = generateKeyPair();
         final X509Certificate rootCa = buildRootCertificationAuthority(rootKeyPair);
 
@@ -77,21 +78,27 @@ public class Main {
         final X509Certificate httpsCertificate = buildHttpsCertificate(keyPair, rootCa, rootKeyPair.getPrivate());
 
         final DisposableServer server = setupHttpServer(httpsCertificate, keyPair.getPrivate());
-        final HttpClient client = setupHttpClient(rootCa);
 
-        client.get()
-                .responseSingle((final HttpClientResponse response, final ByteBufMono byteBufMono) -> {
-                    final HttpResponseStatus status = response.status();
-                    if (!HttpStatusClass.SUCCESS.contains(status.code())) {
-                        return Mono.error(new RuntimeException("Server response: " + status));
-                    }
-                    return byteBufMono.asString();
-                })
-                .doOnError((final Throwable error) -> {
-                    throw new RuntimeException(error);
-                })
-                .doFinally((final SignalType signalType) -> server.disposeNow())
-                .block();
+        try (final HttpClient client = setupHttpClient(rootCa)) {
+            final HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("https://" + HOST + ":" + PORT))
+                    .GET()
+                    .build();
+
+            final HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.version() != HttpClient.Version.HTTP_2) {
+                throw new RuntimeException("Server response protocol: " + response.version());
+            }
+
+            if (!HttpStatusClass.SUCCESS.contains(response.statusCode())) {
+                throw new RuntimeException("Server response: " + response.statusCode());
+            }
+
+            System.out.println("Server response: " + response.body());
+
+            server.disposeNow();
+        }
     }
 
     private static KeyPair generateKeyPair() throws NoSuchAlgorithmException, NoSuchProviderException {
@@ -151,10 +158,9 @@ public class Main {
         final KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KEY_MANAGER_ALGORITHM, JSSE_PROVIDER);
         keyManagerFactory.init(keyStore, null);
 
-        final SslContext sslContext = SslContextBuilder.forServer(keyManagerFactory)
-                .sslProvider(SSL_PROVIDER)
-                .enableOcsp(true)
-                .build();
+        final SslContext sslContext = Http2SslContextSpec
+                .forServer(keyManagerFactory)
+                .sslContext();
 
         final HttpServer httpServer = HttpServer
                 .create()
@@ -162,36 +168,32 @@ public class Main {
                 .port(PORT)
                 .protocol(HttpProtocol.H2)
                 .secure(sslContextSpec -> sslContextSpec.sslContext(sslContext))
-                .wiretap(HttpServer.class.getName(), LogLevel.INFO, AdvancedByteBufFormat.HEX_DUMP)
+                // .wiretap(HttpServer.class.getName(), LogLevel.INFO, AdvancedByteBufFormat.HEX_DUMP)
                 .metrics(true, Function.identity())
-                .handle((final HttpServerRequest request, final HttpServerResponse response) ->
-                        response.sendString(Mono.just("Hello from server")));
+                .handle((final HttpServerRequest request, final HttpServerResponse response) -> {
+                    if (HttpVersion.valueOf(request.protocol()).majorVersion() != 2) {
+                        throw new RuntimeException("Unsupported HTTP version: " + request.protocol());
+                    }
+                    return response.sendString(Mono.just("Hello from server"));
+                });
         return httpServer.bindNow();
     }
 
     private static HttpClient setupHttpClient(X509Certificate rootCa)
-            throws CertificateException, KeyStoreException, IOException, NoSuchAlgorithmException,
-            NoSuchProviderException {
+            throws CertificateException, KeyStoreException, IOException, NoSuchAlgorithmException, NoSuchProviderException, KeyManagementException {
         final KeyStore trustStore = loadKeyStore();
         trustStore.setCertificateEntry("rootCA", rootCa);
 
         final TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(KEY_MANAGER_ALGORITHM, JSSE_PROVIDER);
         trustManagerFactory.init(trustStore);
 
-        final SslContext sslContext = SslContextBuilder.forClient()
-                .trustManager(trustManagerFactory)
-                .sslProvider(SSL_PROVIDER)
-                .enableOcsp(true)
-                .build();
+        final SSLContext sslContext = SSLContext.getInstance(SSL_CONTEXT_ALGORITHM, JSSE_PROVIDER);
+        sslContext.init(null, trustManagerFactory.getTrustManagers(), null);
 
-        return HttpClient
-                .create()
-                .host(HOST)
-                .port(PORT)
-                .protocol(HttpProtocol.H2)
-                .secure(sslContextSpec -> sslContextSpec.sslContext(sslContext))
-                .wiretap(HttpClient.class.getName(), LogLevel.INFO, AdvancedByteBufFormat.HEX_DUMP)
-                .metrics(true, Function.identity());
+        return HttpClient.newBuilder()
+                .sslContext(sslContext)
+                .version(HttpClient.Version.HTTP_2)
+                .build();
     }
 
     private static KeyStore loadKeyStore()
