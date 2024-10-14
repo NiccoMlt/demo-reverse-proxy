@@ -1,9 +1,11 @@
 package com.diennea.carapace;
 
 import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpStatusClass;
 import io.netty.handler.logging.LogLevel;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.ssl.SslProvider;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.security.KeyPair;
@@ -29,6 +31,7 @@ import org.bouncycastle.cert.X509CertificateHolder;
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.bouncycastle.jsse.provider.BouncyCastleJsseProvider;
 import org.bouncycastle.operator.ContentSigner;
 import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
@@ -47,12 +50,20 @@ import reactor.tools.agent.ReactorDebugAgent;
 
 public class Main {
 
-    public static final String PROVIDER = BouncyCastleProvider.PROVIDER_NAME;
+    private static final String JCA_PROVIDER = BouncyCastleProvider.PROVIDER_NAME;
+    private static final String JSSE_PROVIDER = BouncyCastleJsseProvider.PROVIDER_NAME;
     private static final String HOST = "localhost";
     private static final int PORT = 8080;
+    private static final String KEYSTORE_TYPE = "PKCS12";
+    private static final String KEY_ALGORITHM = "RSA";
+    private static final SslProvider SSL_PROVIDER = SslProvider.OPENSSL;
+    private static final String KEY_MANAGER_ALGORITHM = "PKIX";
+    private static final String HASH_ALGORITHM = "SHA256";
+    private static final String CERT_ALGORITHM = HASH_ALGORITHM + "with" + KEY_ALGORITHM;
 
     static {
         Security.insertProviderAt(new BouncyCastleProvider(), 1);
+        Security.insertProviderAt(new BouncyCastleJsseProvider(), 2);
         ReactorDebugAgent.init();
     }
 
@@ -66,13 +77,12 @@ public class Main {
         final X509Certificate httpsCertificate = buildHttpsCertificate(keyPair, rootCa, rootKeyPair.getPrivate());
 
         final DisposableServer server = setupHttpServer(httpsCertificate, keyPair.getPrivate());
-
         final HttpClient client = setupHttpClient(rootCa);
 
         client.get()
                 .responseSingle((final HttpClientResponse response, final ByteBufMono byteBufMono) -> {
                     final HttpResponseStatus status = response.status();
-                    if (status.code() < 200 || status.code() >= 300) {
+                    if (!HttpStatusClass.SUCCESS.contains(status.code())) {
                         return Mono.error(new RuntimeException("Server response: " + status));
                     }
                     return byteBufMono.asString();
@@ -84,54 +94,10 @@ public class Main {
                 .block();
     }
 
-    private static DisposableServer setupHttpServer(final X509Certificate httpsCertificate, final PrivateKey privateKey)
-            throws CertificateException, KeyStoreException, IOException, NoSuchAlgorithmException,
-            NoSuchProviderException, UnrecoverableKeyException {
-        final KeyStore keyStore = loadKeyStore();
-        keyStore.setKeyEntry("httpsCert", privateKey, null, new X509Certificate[] {httpsCertificate});
-
-        final KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance("SunX509");
-        keyManagerFactory.init(keyStore, null);
-
-        final SslContext sslContext = SslContextBuilder.forServer(keyManagerFactory)
-                .sslProvider(io.netty.handler.ssl.SslProvider.OPENSSL)
-                .build();
-
-        final HttpServer httpServer = HttpServer
-                .create()
-                .host(HOST)
-                .port(PORT)
-                .protocol(HttpProtocol.H2)
-                .secure(sslContextSpec -> sslContextSpec.sslContext(sslContext))
-                .wiretap(HttpServer.class.getName(), LogLevel.INFO, AdvancedByteBufFormat.HEX_DUMP)
-                .metrics(true, Function.identity())
-                .handle((final HttpServerRequest request, final HttpServerResponse response) ->
-                        response.sendString(Mono.just("Hello from server")));
-        return httpServer.bindNow();
-    }
-
-    private static HttpClient setupHttpClient(X509Certificate rootCa)
-            throws CertificateException, KeyStoreException, IOException, NoSuchAlgorithmException,
-            NoSuchProviderException {
-        final KeyStore trustStore = loadKeyStore();
-        trustStore.setCertificateEntry("rootCA", rootCa);
-
-        final TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance("SunX509");
-        trustManagerFactory.init(trustStore);
-
-        final SslContext sslContext = SslContextBuilder.forClient()
-                .trustManager(trustManagerFactory)
-                .sslProvider(io.netty.handler.ssl.SslProvider.OPENSSL)
-                .build();
-
-        return HttpClient
-                .create()
-                .host(HOST)
-                .port(PORT)
-                .protocol(HttpProtocol.H2)
-                .secure(sslContextSpec -> sslContextSpec.sslContext(sslContext))
-                .wiretap(HttpClient.class.getName(), LogLevel.INFO, AdvancedByteBufFormat.HEX_DUMP)
-                .metrics(true, Function.identity());
+    private static KeyPair generateKeyPair() throws NoSuchAlgorithmException, NoSuchProviderException {
+        final KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance(KEY_ALGORITHM, JCA_PROVIDER);
+        keyPairGenerator.initialize(2048);
+        return keyPairGenerator.generateKeyPair();
     }
 
     private static X509Certificate buildRootCertificationAuthority(final KeyPair keyPair)
@@ -154,9 +120,9 @@ public class Main {
                 issuer /* self-signed, so issuer and subject are the same */,
                 keyPair.getPublic()
         );
-        final ContentSigner contentSigner = new JcaContentSignerBuilder("SHA256withRSA").build(keyPair.getPrivate());
+        final ContentSigner contentSigner = new JcaContentSignerBuilder(CERT_ALGORITHM).build(keyPair.getPrivate());
         final X509CertificateHolder x509CertificateHolder = x509CertificateBuilder.build(contentSigner);
-        return new JcaX509CertificateConverter().setProvider(PROVIDER).getCertificate(x509CertificateHolder);
+        return new JcaX509CertificateConverter().setProvider(JCA_PROVIDER).getCertificate(x509CertificateHolder);
     }
 
     private static X509Certificate buildHttpsCertificate(final KeyPair keyPair, final X509Certificate rootCa,
@@ -171,22 +137,66 @@ public class Main {
                 new X500NameBuilder().addRDN(BCStyle.CN, HOST).build(),
                 keyPair.getPublic()
         );
-        final ContentSigner contentSigner = new JcaContentSignerBuilder("SHA256withRSA").build(rootPrivateKey);
+        final ContentSigner contentSigner = new JcaContentSignerBuilder(CERT_ALGORITHM).build(rootPrivateKey);
         final X509CertificateHolder x509CertificateHolder = x509CertificateBuilder.build(contentSigner);
-        return new JcaX509CertificateConverter().setProvider(PROVIDER).getCertificate(x509CertificateHolder);
+        return new JcaX509CertificateConverter().setProvider(JCA_PROVIDER).getCertificate(x509CertificateHolder);
+    }
+
+    private static DisposableServer setupHttpServer(final X509Certificate httpsCertificate, final PrivateKey privateKey)
+            throws CertificateException, KeyStoreException, IOException, NoSuchAlgorithmException,
+            NoSuchProviderException, UnrecoverableKeyException {
+        final KeyStore keyStore = loadKeyStore();
+        keyStore.setKeyEntry("httpsCert", privateKey, null, new X509Certificate[]{httpsCertificate});
+
+        final KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KEY_MANAGER_ALGORITHM, JSSE_PROVIDER);
+        keyManagerFactory.init(keyStore, null);
+
+        final SslContext sslContext = SslContextBuilder.forServer(keyManagerFactory)
+                .sslProvider(SSL_PROVIDER)
+                .build();
+
+        final HttpServer httpServer = HttpServer
+                .create()
+                .host(HOST)
+                .port(PORT)
+                .protocol(HttpProtocol.H2)
+                .secure(sslContextSpec -> sslContextSpec.sslContext(sslContext))
+                .wiretap(HttpServer.class.getName(), LogLevel.INFO, AdvancedByteBufFormat.HEX_DUMP)
+                .metrics(true, Function.identity())
+                .handle((final HttpServerRequest request, final HttpServerResponse response) ->
+                        response.sendString(Mono.just("Hello from server")));
+        return httpServer.bindNow();
+    }
+
+    private static HttpClient setupHttpClient(X509Certificate rootCa)
+            throws CertificateException, KeyStoreException, IOException, NoSuchAlgorithmException,
+            NoSuchProviderException {
+        final KeyStore trustStore = loadKeyStore();
+        trustStore.setCertificateEntry("rootCA", rootCa);
+
+        final TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(KEY_MANAGER_ALGORITHM, JSSE_PROVIDER);
+        trustManagerFactory.init(trustStore);
+
+        final SslContext sslContext = SslContextBuilder.forClient()
+                .trustManager(trustManagerFactory)
+                .sslProvider(SSL_PROVIDER)
+                .build();
+
+        return HttpClient
+                .create()
+                .host(HOST)
+                .port(PORT)
+                .protocol(HttpProtocol.H2)
+                .secure(sslContextSpec -> sslContextSpec.sslContext(sslContext))
+                .wiretap(HttpClient.class.getName(), LogLevel.INFO, AdvancedByteBufFormat.HEX_DUMP)
+                .metrics(true, Function.identity());
     }
 
     private static KeyStore loadKeyStore()
             throws KeyStoreException, IOException, NoSuchAlgorithmException, CertificateException,
             NoSuchProviderException {
-        final KeyStore keyStore = KeyStore.getInstance("PKCS12", PROVIDER);
+        final KeyStore keyStore = KeyStore.getInstance(KEYSTORE_TYPE, JCA_PROVIDER);
         keyStore.load(null, null);
         return keyStore;
-    }
-
-    private static KeyPair generateKeyPair() throws NoSuchAlgorithmException, NoSuchProviderException {
-        final KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance("RSA", PROVIDER);
-        keyPairGenerator.initialize(2048);
-        return keyPairGenerator.generateKeyPair();
     }
 }
