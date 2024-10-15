@@ -366,8 +366,7 @@ public class Main {
             return null;
         }
 
-        final BasicOCSPResp basicResponse = (BasicOCSPResp) ocspResp.getResponseObject();
-        return basicResponse.getEncoded(); // Return the DER-encoded OCSP response
+        return ocspResp.getEncoded();
     }
 
 
