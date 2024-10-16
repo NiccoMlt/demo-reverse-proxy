@@ -25,18 +25,28 @@ import java.security.NoSuchProviderException;
 import java.security.PrivateKey;
 import java.security.SecureRandom;
 import java.security.Security;
+import java.security.cert.CertPathBuilder;
 import java.security.cert.CertificateEncodingException;
 import java.security.cert.CertificateException;
+import java.security.cert.PKIXBuilderParameters;
+import java.security.cert.PKIXRevocationChecker;
+import java.security.cert.X509CertSelector;
 import java.security.cert.X509Certificate;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.function.Function;
 import javax.net.ssl.ExtendedSSLSession;
+import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSession;
+import javax.net.ssl.SSLSocketFactory;
+import javax.net.ssl.TrustManager;
 import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509TrustManager;
 import org.bouncycastle.asn1.DERSequence;
 import org.bouncycastle.asn1.DERUTF8String;
 import org.bouncycastle.asn1.x500.X500Name;
@@ -97,6 +107,7 @@ public class Main {
         System.setProperty("jdk.tls.client.enableStatusRequestExtension", "true"); // Enable OCSP stapling on the client
         System.setProperty("jdk.tls.server.enableStatusRequestExtension", "true"); // Enable OCSP stapling on the server
         System.setProperty("com.sun.net.ssl.checkRevocation", "true"); // Enable revocation checking; alternative to PKIXParameters#setRevocationEnabled
+        System.setProperty("javax.net.debug", "ssl:handshake:verbose");
 
         // System.setProperty("javax.net.debug", "all");
         ReactorDebugAgent.init();
@@ -421,8 +432,28 @@ public class Main {
         final TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(KEY_MANAGER_ALGORITHM, JSSE_PROVIDER);
         trustManagerFactory.init(trustStore);
 
+        final var trustManagers = trustManagerFactory.getTrustManagers();
+        if (!(trustManagers[0] instanceof X509TrustManager pkixTrustManager)) {
+            throw new RuntimeException("Unexpected trust managers types: " + Arrays.toString(trustManagers));
+        }
+
+        if (!(CertPathBuilder.getInstance(KEY_MANAGER_ALGORITHM).getRevocationChecker() instanceof PKIXRevocationChecker revocationChecker)) {
+            throw new RuntimeException("PKIX RevocationChecker not supported");
+        }
+
+        if (!revocationChecker.getOptions().isEmpty()) {
+            throw new RuntimeException("Unexpected PKIX RevocationChecker options: " + revocationChecker.getOptions());
+        }
+
+        final PKIXBuilderParameters pkixParams = new PKIXBuilderParameters(trustStore, new X509CertSelector());
+        pkixParams.addCertPathChecker(revocationChecker);
+        pkixParams.setRevocationEnabled(true);  // Enable revocation checking
+
         final SSLContext sslContext = SSLContext.getInstance(SSL_CONTEXT_ALGORITHM, JSSE_PROVIDER);
-        sslContext.init(null, trustManagerFactory.getTrustManagers(), null);
+        sslContext.init(null, new TrustManager[]{pkixTrustManager}, null);
+
+        final SSLSocketFactory sslSocketFactory = sslContext.getSocketFactory();
+        HttpsURLConnection.setDefaultSSLSocketFactory(sslSocketFactory);
 
         return HttpClient.newBuilder()
                 .sslContext(sslContext)
