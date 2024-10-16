@@ -30,12 +30,8 @@ import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.util.Base64;
 import java.util.Date;
-import java.util.List;
 import java.util.function.Function;
-import javax.net.ssl.ExtendedSSLSession;
 import javax.net.ssl.KeyManagerFactory;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLSession;
 import javax.net.ssl.TrustManagerFactory;
 import org.bouncycastle.asn1.DERSequence;
 import org.bouncycastle.asn1.DERUTF8String;
@@ -71,6 +67,7 @@ import reactor.netty.http.HttpProtocol;
 import reactor.netty.http.server.HttpServer;
 import reactor.netty.http.server.HttpServerRequest;
 import reactor.netty.http.server.HttpServerResponse;
+import reactor.netty.tcp.SslProvider.SslContextSpec;
 import reactor.tools.agent.ReactorDebugAgent;
 
 public class Main {
@@ -138,40 +135,47 @@ public class Main {
 
 //        Mono.when(ocspResponder.onDispose(), server.onDispose()).block();
 
-        try (final HttpClient client = setupHttpClient(rootCa)) {
-            final HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create("https://" + HOST + ":" + PORT))
-                    .GET()
-                    .build();
+        final reactor.netty.http.client.HttpClient client = setupHttpClient(rootCa);
 
-            final HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+        client.get()
+                .responseSingle((httpClientResponse, byteBufMono) -> {
+                    if (httpClientResponse.version().majorVersion() != 2) {
+                        throw new RuntimeException("Unsupported HTTP version: " + httpClientResponse.version());
+                    }
+                    if (!HttpStatusClass.SUCCESS.contains(httpClientResponse.status().code())) {
+                        throw new RuntimeException("Server response: " + httpClientResponse.status().code());
+                    }
+                    return byteBufMono.asString();
+                })
+                .doOnNext(body -> System.out.println("Server response: " + body)).block();
 
-            if (response.version() != HttpClient.Version.HTTP_2) {
-                throw new RuntimeException("Server response protocol: " + response.version());
-            }
+        /* final HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
 
-            if (!HttpStatusClass.SUCCESS.contains(response.statusCode())) {
-                throw new RuntimeException("Server response: " + response.statusCode());
-            }
-
-            final SSLSession sslSession = response.sslSession().orElseThrow();
-            if (!(sslSession instanceof ExtendedSSLSession extendedSSLSession)) {
-                throw new RuntimeException("SSL Session of unexpected type: " + sslSession);
-            }
-
-            // The OCSP response is encoded using the Distinguished Encoding Rules (DER) in a format described by the ASN.1 found in RFC 6960
-            final List<byte[]> statusResponses = extendedSSLSession.getStatusResponses();
-            if (statusResponses == null || statusResponses.isEmpty()) {
-                throw new RuntimeException("OCSP response missing.");
-            } else {
-                System.out.println("Received OCSP responses: " + statusResponses.size());
-            }
-
-            System.out.println("Server response: " + response.body());
-
-            ocspResponder.disposeNow();
-            server.disposeNow();
+        if (response.version() != HttpClient.Version.HTTP_2) {
+            throw new RuntimeException("Server response protocol: " + response.version());
         }
+
+        if (!HttpStatusClass.SUCCESS.contains(response.statusCode())) {
+            throw new RuntimeException("Server response: " + response.statusCode());
+        }
+
+        final SSLSession sslSession = response.sslSession().orElseThrow();
+        if (!(sslSession instanceof ExtendedSSLSession extendedSSLSession)) {
+            throw new RuntimeException("SSL Session of unexpected type: " + sslSession);
+        }
+
+        // The OCSP response is encoded using the Distinguished Encoding Rules (DER) in a format described by the ASN.1 found in RFC 6960
+        final List<byte[]> statusResponses = extendedSSLSession.getStatusResponses();
+        if (statusResponses == null || statusResponses.isEmpty()) {
+            throw new RuntimeException("OCSP response missing.");
+        } else {
+            System.out.println("Received OCSP responses: " + statusResponses.size());
+        }
+
+        System.out.println("Server response: " + response.body()); */
+
+        ocspResponder.disposeNow();
+        server.disposeNow();
     }
 
     private static KeyPair generateKeyPair() throws NoSuchAlgorithmException, NoSuchProviderException {
@@ -414,19 +418,28 @@ public class Main {
         return keyStore;
     }
 
-    private static HttpClient setupHttpClient(final X509Certificate rootCa) throws GeneralSecurityException, IOException {
+    private static reactor.netty.http.client.HttpClient setupHttpClient(final X509Certificate rootCa) throws GeneralSecurityException, IOException {
         final KeyStore trustStore = loadKeyStore();
         trustStore.setCertificateEntry("rootCA", rootCa);
 
         final TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(KEY_MANAGER_ALGORITHM, JSSE_PROVIDER);
         trustManagerFactory.init(trustStore);
 
-        final SSLContext sslContext = SSLContext.getInstance(SSL_CONTEXT_ALGORITHM, JSSE_PROVIDER);
-        sslContext.init(null, trustManagerFactory.getTrustManagers(), null);
+        final SslContextBuilder sslContext = SslContextBuilder.forClient()
+                .trustManager(trustManagerFactory)
+                .sslProvider(SslProvider.OPENSSL)
+                .applicationProtocolConfig(new ApplicationProtocolConfig(
+                        ApplicationProtocolConfig.Protocol.ALPN,
+                        ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
+                        ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
+                        ApplicationProtocolNames.HTTP_2
+                ))
+                .enableOcsp(true);
 
-        return HttpClient.newBuilder()
-                .sslContext(sslContext)
-                .version(HttpClient.Version.HTTP_2)
-                .build();
+        return reactor.netty.http.client.HttpClient.create()
+                .host(HOST)
+                .port(PORT)
+                .secure((SslContextSpec sslContextSpec) -> sslContextSpec.sslContext(sslContext))
+                .protocol(HttpProtocol.H2);
     }
 }

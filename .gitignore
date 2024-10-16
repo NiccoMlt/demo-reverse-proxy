@@ -39,3 +39,5 @@ build/
 
 ### Generated certificates ###
 *.crt
+*.cer
+*.p12

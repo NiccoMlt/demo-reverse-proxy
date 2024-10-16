@@ -46,7 +46,20 @@
         <dependency>
             <groupId>io.netty</groupId>
             <artifactId>netty-tcnative-boringssl-static</artifactId>
+            <classifier>${os.detected.classifier}</classifier>
             <version>2.0.66.Final</version>
+        </dependency>
+        <!--
+            Unable to load io.netty.resolver.dns.macos.MacOSDnsServerAddressStreamProvider, fallback to system defaults.
+            This may result in incorrect DNS resolutions on MacOS.
+            Check whether you have a dependency on 'io.netty:netty-resolver-dns-native-macos'.
+            Use DEBUG level to see the full stack: java.lang.UnsatisfiedLinkError: failed to load the required native library
+        -->
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-resolver-dns-native-macos</artifactId>
+            <version>4.1.112.Final</version>
+            <classifier>${os.detected.classifier}</classifier>
         </dependency>
 
         <!-- https://docs.micrometer.io/micrometer/reference/installing.html -->
@@ -72,5 +85,15 @@
             <version>1.78.1</version>
         </dependency>
     </dependencies>
+
+    <build>
+        <extensions>
+            <extension>
+                <groupId>kr.motd.maven</groupId>
+                <artifactId>os-maven-plugin</artifactId>
+                <version>1.4.0.Final</version>
+            </extension>
+        </extensions>
+    </build>
 
 </project>
