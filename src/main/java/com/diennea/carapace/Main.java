@@ -1,27 +1,39 @@
 package com.diennea.carapace;
 
 import io.netty.handler.codec.http.HttpStatusClass;
-import io.netty.handler.ssl.*;
-
-import java.io.File;
-import java.io.FileInputStream;
+import io.netty.handler.ssl.ApplicationProtocolConfig;
+import io.netty.handler.ssl.ApplicationProtocolNames;
+import io.netty.handler.ssl.OpenSsl;
+import io.netty.handler.ssl.OpenSslCachingX509KeyManagerFactory;
+import io.netty.handler.ssl.ReferenceCountedOpenSslEngine;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.ssl.SslHandler;
+import io.netty.handler.ssl.SslProvider;
+import java.io.FileWriter;
 import java.io.IOException;
-import java.io.InputStream;
 import java.math.BigInteger;
 import java.net.URI;
-import java.net.URL;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.nio.file.Files;
-import java.nio.file.Paths;
-import java.security.*;
-import java.security.cert.CertificateEncodingException;
+import java.security.GeneralSecurityException;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.KeyStore;
+import java.security.NoSuchAlgorithmException;
+import java.security.NoSuchProviderException;
+import java.security.PrivateKey;
+import java.security.Provider;
+import java.security.PublicKey;
+import java.security.SecureRandom;
+import java.security.Security;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
-import java.util.Base64;
+import java.time.ZonedDateTime;
 import java.util.Date;
 import java.util.List;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import javax.net.ssl.ExtendedSSLSession;
 import javax.net.ssl.KeyManagerFactory;
@@ -33,8 +45,10 @@ import org.bouncycastle.asn1.DERUTF8String;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x500.X500NameBuilder;
 import org.bouncycastle.asn1.x500.style.BCStyle;
+import org.bouncycastle.asn1.x509.AccessDescription;
 import org.bouncycastle.asn1.x509.BasicConstraints;
 import org.bouncycastle.asn1.x509.Extension;
+import org.bouncycastle.asn1.x509.GeneralName;
 import org.bouncycastle.asn1.x509.KeyUsage;
 import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
 import org.bouncycastle.cert.CertIOException;
@@ -50,9 +64,12 @@ import org.bouncycastle.cert.ocsp.OCSPReq;
 import org.bouncycastle.cert.ocsp.OCSPReqBuilder;
 import org.bouncycastle.cert.ocsp.OCSPResp;
 import org.bouncycastle.cert.ocsp.OCSPRespBuilder;
+import org.bouncycastle.cert.ocsp.RevokedStatus;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.jsse.provider.BouncyCastleJsseProvider;
+import org.bouncycastle.openssl.jcajce.JcaPEMWriter;
 import org.bouncycastle.operator.ContentSigner;
+import org.bouncycastle.operator.DigestCalculator;
 import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.bouncycastle.operator.jcajce.JcaDigestCalculatorProviderBuilder;
@@ -66,8 +83,10 @@ import reactor.tools.agent.ReactorDebugAgent;
 
 public class Main {
 
-    private static final String JCA_PROVIDER = BouncyCastleProvider.PROVIDER_NAME;
-    private static final String JSSE_PROVIDER = BouncyCastleJsseProvider.PROVIDER_NAME;
+    private static final Provider BC_PROVIDER = new BouncyCastleProvider();
+    private static final Provider BC_JSSE_PROVIDER = new BouncyCastleJsseProvider();
+    private static final SecureRandom PRNG = new SecureRandom();
+
     private static final String HOST = "localhost";
     private static final int PORT = 8443;
     private static final String KEYSTORE_TYPE = "PKCS12";
@@ -78,8 +97,6 @@ public class Main {
     private static final String SSL_CONTEXT_ALGORITHM = "TLS";
     private static final int OCSP_PORT = 8080;
     private static final URI OCSP_RESPONDER_URL = URI.create("http://" + HOST + ":" + OCSP_PORT + "/ocsp");
-
-    private static final String KEYSTORE_FORMAT = "PKCS12";
 
     static {
         Security.insertProviderAt(new BouncyCastleProvider(), 1);
@@ -106,27 +123,31 @@ public class Main {
     public static void main(final String... args) throws Exception {
         // Generate a root self-signed certificate that acts as a CA...
         final KeyPair rootKeyPair = generateKeyPair();
-        final X509Certificate rootCa = buildRootCertificationAuthority(rootKeyPair);
+        final ContentSigner contentSigner = new JcaContentSignerBuilder(CERT_ALGORITHM).build(rootKeyPair.getPrivate());
+        final X509Certificate rootCa = buildRootCertificationAuthority(rootKeyPair.getPublic(), contentSigner);
 
         // Save the root CA certificate to a file
         saveCertificateToFile(rootCa, "rootCA.crt");
 
         // ... and generate an HTTPS certificate signed by the CA
         final KeyPair keyPair = generateKeyPair();
-        final X509Certificate httpsCertificate = buildHttpsCertificate(keyPair, rootCa, rootKeyPair.getPrivate());
+        final X509Certificate httpsCertificate1 = buildHttpsCertificate(rootCa, contentSigner);
+        final X509Certificate httpsCertificate2 = buildHttpsCertificate(rootCa, contentSigner);
 
         // Save the HTTPS certificate to a file
-        saveCertificateToFile(httpsCertificate, "httpsCertificate.crt");
+        saveCertificateToFile(httpsCertificate1, "httpsCertificate1.crt");
+        saveCertificateToFile(httpsCertificate2, "httpsCertificate2.crt");
 
         // Start OCSP Responder
         final DisposableServer ocspResponder = setupOcspResponder(rootKeyPair);
 
         // Send OCSP request and verify the certificate status
-        verifyCertificateWithOCSP(rootCa, httpsCertificate);
+        verifyCertificateWithOCSP(rootCa, httpsCertificate1);
+        verifyCertificateWithOCSP(rootCa, httpsCertificate2);
 
 //        ocspResponder.onDispose().block();
 
-        final DisposableServer server = setupHttpServer(rootCa, httpsCertificate, keyPair.getPrivate());
+        final DisposableServer server = setupHttpServer(rootCa, keyPair.getPrivate(), httpsCertificate1, httpsCertificate2);
 
 //        server.onDispose().block();
 
@@ -168,12 +189,12 @@ public class Main {
     }
 
     private static KeyPair generateKeyPair() throws NoSuchAlgorithmException, NoSuchProviderException {
-        final KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance(KEY_ALGORITHM, JCA_PROVIDER);
+        final KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance(KEY_ALGORITHM, BC_PROVIDER);
         keyPairGenerator.initialize(2048);
         return keyPairGenerator.generateKeyPair();
     }
 
-    private static X509Certificate buildRootCertificationAuthority(final KeyPair keyPair) throws OperatorCreationException, CertificateException, CertIOException {
+    private static X509Certificate buildRootCertificationAuthority(final PublicKey publicKey, final ContentSigner contentSigner) throws CertificateException, CertIOException {
         final X500Name issuer = new X500NameBuilder()
                 .addRDN(BCStyle.CN, new DERUTF8String("Root CA"))
                 .addRDN(BCStyle.O, new DERUTF8String("Diennea"))
@@ -183,53 +204,56 @@ public class Main {
                 .addRDN(BCStyle.ST, new DERUTF8String("Ravenna"))
                 .build();
 
-        final long now = System.currentTimeMillis();
-        final BigInteger serialNumber = BigInteger.valueOf(new SecureRandom().nextInt());
-
+        final ZonedDateTime now = ZonedDateTime.now();
         final JcaX509v3CertificateBuilder x509CertificateBuilder = new JcaX509v3CertificateBuilder(
                 issuer,
-                serialNumber,
-                new Date(now),
-                new Date(now + 365 * 24 * 60 * 60 * 1000L /* 1 year */),
+                new BigInteger(Long.SIZE, PRNG),
+                Date.from(now.toInstant()),
+                Date.from(now.plusYears(1).toInstant()),
                 issuer /* self-signed, so issuer and subject are the same */,
-                keyPair.getPublic()
+                publicKey
         );
 
-        final ContentSigner contentSigner = new JcaContentSignerBuilder(CERT_ALGORITHM).build(keyPair.getPrivate());
         final X509CertificateHolder x509CertificateHolder = x509CertificateBuilder
                 .addExtension(Extension.keyUsage, true, new KeyUsage(KeyUsage.cRLSign | KeyUsage.keyCertSign))
                 .addExtension(Extension.basicConstraints, true, new BasicConstraints(true)) // This is a CA
                 .build(contentSigner);
-        return new JcaX509CertificateConverter().setProvider(JCA_PROVIDER).getCertificate(x509CertificateHolder);
+        return new JcaX509CertificateConverter().setProvider(BC_PROVIDER).getCertificate(x509CertificateHolder);
     }
 
-    private static void saveCertificateToFile(X509Certificate certificate, String filename) throws IOException, CertificateEncodingException {
-        final String pem = "-----BEGIN CERTIFICATE-----\n"
-                     + Base64.getEncoder().encodeToString(certificate.getEncoded())
-                     + "\n-----END CERTIFICATE-----\n";
-        Files.write(Paths.get(filename), pem.getBytes());
+    private static void saveCertificateToFile(X509Certificate certificate, String filename) throws IOException {
+        try (final JcaPEMWriter pemWriter = new JcaPEMWriter(new FileWriter(filename))) {
+            pemWriter.writeObject(certificate);
+        }
         System.out.println("Saved certificate to " + filename);
     }
 
-    private static X509Certificate buildHttpsCertificate(final KeyPair keyPair, final X509Certificate rootCa, final PrivateKey rootPrivateKey) throws OperatorCreationException, CertificateException, IOException {
-        final long now = System.currentTimeMillis();
+    private static X509Certificate buildHttpsCertificate(final X509Certificate rootCa, final ContentSigner contentSigner) throws CertificateException, IOException {
+        final var subject = new X500NameBuilder()
+                .addRDN(BCStyle.CN, new DERUTF8String(HOST))
+                .addRDN(BCStyle.OU, new DERUTF8String("Italy"))
+                .addRDN(BCStyle.O, new DERUTF8String("Italy"))
+                .addRDN(BCStyle.L, new DERUTF8String("Italy"))
+                .addRDN(BCStyle.ST, new DERUTF8String("Italy"))
+                .addRDN(BCStyle.C, new DERUTF8String("XX"))
+                .build();
         final JcaX509v3CertificateBuilder x509CertificateBuilder = new JcaX509v3CertificateBuilder(
                 rootCa,
-                BigInteger.valueOf(now),
-                new Date(now),
-                new Date(now + 365 * 24 * 60 * 60 * 1000L /* 1 year */),
-                new X500NameBuilder().addRDN(BCStyle.CN, HOST).build(),
-                keyPair.getPublic()
+                new BigInteger(Long.SIZE, PRNG),
+                rootCa.getNotBefore(),
+                rootCa.getNotAfter(),
+                subject,
+                rootCa.getPublicKey()
         );
 
         // Add the AIA extension with the OCSP responder URI
         final Extension aiaExtension = new Extension(
                 Extension.authorityInfoAccess,
                 false, // extension is not critical
-                new DERSequence(new org.bouncycastle.asn1.x509.AccessDescription(
-                        org.bouncycastle.asn1.x509.AccessDescription.id_ad_ocsp,
-                        new org.bouncycastle.asn1.x509.GeneralName(
-                                org.bouncycastle.asn1.x509.GeneralName.uniformResourceIdentifier,
+                new DERSequence(new AccessDescription(
+                        AccessDescription.id_ad_ocsp,
+                        new GeneralName(
+                                GeneralName.uniformResourceIdentifier,
                                 OCSP_RESPONDER_URL.toString() // OCSP responder URI
                         )
                 )).getEncoded()
@@ -237,12 +261,9 @@ public class Main {
 
         x509CertificateBuilder.addExtension(aiaExtension);
 
-        final ContentSigner contentSigner = new JcaContentSignerBuilder(CERT_ALGORITHM)
-                .setProvider(JCA_PROVIDER)
-                .build(rootPrivateKey);
         final X509CertificateHolder x509CertificateHolder = x509CertificateBuilder.build(contentSigner);
         return new JcaX509CertificateConverter()
-                .setProvider(JCA_PROVIDER)
+                .setProvider(BC_PROVIDER)
                 .getCertificate(x509CertificateHolder);
     }
 
@@ -261,7 +282,7 @@ public class Main {
                                 final BasicOCSPRespBuilder responseBuilder = new BasicOCSPRespBuilder(
                                         SubjectPublicKeyInfo.getInstance(caKeyPair.getPublic().getEncoded()),
                                         new JcaDigestCalculatorProviderBuilder()
-                                                .setProvider(JCA_PROVIDER)
+                                                .setProvider(BC_PROVIDER)
                                                 .build()
                                                 .get(CertificateID.HASH_SHA1)
                                 );
@@ -269,7 +290,7 @@ public class Main {
                                 // Here, modify the status as needed (e.g., GOOD, REVOKED, etc.)
                                 responseBuilder.addResponse(certificateID, CertificateStatus.GOOD);
                                 final ContentSigner contentSigner = new JcaContentSignerBuilder("SHA256WithRSAEncryption")
-                                        .setProvider(JCA_PROVIDER)
+                                        .setProvider(BC_PROVIDER)
                                         .build(caKeyPair.getPrivate());
                                 final BasicOCSPResp basicResponse = responseBuilder.build(contentSigner, null, new Date());
 
@@ -297,11 +318,12 @@ public class Main {
         parseOCSPResponse(ocspResp);
     }
 
-    private static DisposableServer setupHttpServer(final X509Certificate issuer, final X509Certificate httpsCertificate, final PrivateKey privateKey) throws GeneralSecurityException, IOException {
+    private static DisposableServer setupHttpServer(final X509Certificate issuer, final PrivateKey privateKey, final X509Certificate httpsCertificate, final X509Certificate httpsCertificateSni) throws GeneralSecurityException, IOException {
         final KeyStore keyStore = loadKeyStore();
         keyStore.setKeyEntry("httpsCert", privateKey, null, new X509Certificate[]{httpsCertificate});
+        keyStore.setKeyEntry("altHttpsCert", privateKey, null, new X509Certificate[]{httpsCertificateSni});
 
-        final KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KEY_MANAGER_ALGORITHM, JSSE_PROVIDER);
+        final KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KEY_MANAGER_ALGORITHM, BC_JSSE_PROVIDER);
         keyManagerFactory.init(keyStore, null);
 
         final SslContext sslContext = SslContextBuilder
@@ -311,18 +333,14 @@ public class Main {
                         ApplicationProtocolConfig.Protocol.ALPN,
                         ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
                         ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
-                        ApplicationProtocolNames.HTTP_2, ApplicationProtocolNames.HTTP_1_1
+                        ApplicationProtocolNames.HTTP_2,
+                        ApplicationProtocolNames.HTTP_1_1
                 ))
                 .enableOcsp(true)
                 .build();
 
-        URL resource = Main.class.getClassLoader().getResource("ia.p12");
-
-        assert resource != null;
-        final KeyStore keyLocalhost = loadKeyStoreFromFile("ia.p12", "changeit", new File(new File(resource.getPath()).getParent()));
-        KeyManagerFactory keyFactory = new OpenSslCachingX509KeyManagerFactory(KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()));
-        keyFactory.init(keyLocalhost, "changeit".toCharArray());
-
+        final KeyManagerFactory keyFactory = new OpenSslCachingX509KeyManagerFactory(KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()));
+        keyFactory.init(keyStore, null);
 
         final SslContext sslContextLocalhost = SslContextBuilder
                 .forServer(keyFactory)
@@ -331,7 +349,8 @@ public class Main {
                         ApplicationProtocolConfig.Protocol.ALPN,
                         ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
                         ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
-                        ApplicationProtocolNames.HTTP_2,ApplicationProtocolNames.HTTP_1_1
+                        ApplicationProtocolNames.HTTP_2,
+                        ApplicationProtocolNames.HTTP_1_1
                 ))
                 .enableOcsp(true)
                 .build();
@@ -341,23 +360,12 @@ public class Main {
                 .host(HOST)
                 .port(PORT)
                 .protocol(HttpProtocol.H2, HttpProtocol.HTTP11)
-                .secure(sslContextSpec -> sslContextSpec.sslContext(sslContext).handlerConfigurator(sslHandler -> {
-                    if (!(sslHandler.engine() instanceof ReferenceCountedOpenSslEngine engine)) {
-                        throw new RuntimeException("Unexpected SSL handler type: " + sslHandler.engine());
-                    }
-
-                    // Attempt to retrieve and set the OCSP response here
-                    try {
-                        final byte[] ocspResponse = getOcspResponse(issuer, httpsCertificate);
-                        if (ocspResponse != null) {
-                            engine.setOcspResponse(ocspResponse);
-                        } else {
-                            System.err.println("Failed to retrieve OCSP response. It is null.");
-                        }
-                    } catch (Exception e) {
-                        throw new RuntimeException("Failed to set OCSP response: " + e.getMessage(), e);
-                    }
-                }).addSniMapping("localhost", sslContextSpec1 -> sslContextSpec1.sslContext(sslContextLocalhost))
+                .secure(sslContextSpec -> sslContextSpec
+                        .sslContext(sslContext)
+                        .handlerConfigurator(getSslHandlerConsumer(issuer, httpsCertificate))
+                        .addSniMapping("localhost", sslContextSpec1 -> sslContextSpec1
+                                .sslContext(sslContextLocalhost)
+                                .handlerConfigurator(getSslHandlerConsumer(issuer, httpsCertificateSni)))
                 )
                 .metrics(true, Function.identity())
                 .handle((final HttpServerRequest request, final HttpServerResponse response) -> {
@@ -370,26 +378,47 @@ public class Main {
         return httpServer.bindNow();
     }
 
-    private static byte[] getOcspResponse(final X509Certificate issuer, final X509Certificate certificate) throws OCSPException, GeneralSecurityException, IOException, OperatorCreationException, InterruptedException {
-        final OCSPReq ocspRequest = generateOCSPRequest(issuer, certificate);
-        final OCSPResp ocspResp = sendOCSPRequest(OCSP_RESPONDER_URL, ocspRequest.getEncoded());
+    private static Consumer<SslHandler> getSslHandlerConsumer(final X509Certificate issuer, final X509Certificate httpsCertificateSni) {
+        return sslHandler -> {
+            if (!(sslHandler.engine() instanceof ReferenceCountedOpenSslEngine engine)) {
+                throw new RuntimeException("Unexpected SSL handler type: " + sslHandler.engine());
+            }
 
-        // Check the response status
-        if (ocspResp.getStatus() != OCSPRespBuilder.SUCCESSFUL) {
-            System.err.println("OCSP response is not successful: " + ocspResp.getStatus());
-            return null;
-        }
-
-        final BasicOCSPResp basicResponse = (BasicOCSPResp) ocspResp.getResponseObject();
-        return basicResponse.getEncoded(); // Return the DER-encoded OCSP response
+            // Attempt to retrieve and set the OCSP response here
+            try {
+                final byte[] ocspResponse = getOcspResponse(issuer, httpsCertificateSni);
+                if (ocspResponse != null) {
+                    engine.setOcspResponse(ocspResponse);
+                } else {
+                    System.err.println("Failed to retrieve OCSP response. It is null.");
+                }
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to set OCSP response: " + e.getMessage(), e);
+            }
+        };
     }
 
+    private static HttpClient setupHttpClient(final X509Certificate rootCa) throws GeneralSecurityException, IOException {
+        final KeyStore trustStore = loadKeyStore();
+        trustStore.setCertificateEntry("rootCA", rootCa);
+
+        final TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(KEY_MANAGER_ALGORITHM, BC_JSSE_PROVIDER);
+        trustManagerFactory.init(trustStore);
+
+        final SSLContext sslContext = SSLContext.getInstance(SSL_CONTEXT_ALGORITHM, BC_JSSE_PROVIDER);
+        sslContext.init(null, trustManagerFactory.getTrustManagers(), null);
+
+        return HttpClient.newBuilder()
+                .sslContext(sslContext)
+                .version(HttpClient.Version.HTTP_1_1)
+                .build();
+    }
 
     private static OCSPReq generateOCSPRequest(final X509Certificate issuerCert, final X509Certificate clientCert) throws GeneralSecurityException, IOException, OperatorCreationException, OCSPException {
-        final var digestCalculator = new JcaDigestCalculatorProviderBuilder()
+        final DigestCalculator digestCalculator = new JcaDigestCalculatorProviderBuilder()
                 .build()
                 .get(CertificateID.HASH_SHA1);
-        final var issuer = new X509CertificateHolder(issuerCert.getEncoded());
+        final X509CertificateHolder issuer = new X509CertificateHolder(issuerCert.getEncoded());
         final CertificateID certificateID = new CertificateID(digestCalculator, issuer, clientCert.getSerialNumber());
         return new OCSPReqBuilder().addRequest(certificateID).build();
     }
@@ -416,7 +445,7 @@ public class Main {
             System.out.println("The certificate is GOOD.");
             return;
         }
-        if (certStatus instanceof org.bouncycastle.cert.ocsp.RevokedStatus) {
+        if (certStatus instanceof RevokedStatus) {
             System.out.println("The certificate is REVOKED.");
             return;
         }
@@ -424,45 +453,22 @@ public class Main {
     }
 
     private static KeyStore loadKeyStore() throws GeneralSecurityException, IOException {
-        final KeyStore keyStore = KeyStore.getInstance(KEYSTORE_TYPE, JCA_PROVIDER);
+        final KeyStore keyStore = KeyStore.getInstance(KEYSTORE_TYPE, BC_PROVIDER);
         keyStore.load(null, null);
         return keyStore;
     }
 
-    private static HttpClient setupHttpClient(final X509Certificate rootCa) throws GeneralSecurityException, IOException {
-        final KeyStore trustStore = loadKeyStore();
-        trustStore.setCertificateEntry("rootCA", rootCa);
+    private static byte[] getOcspResponse(final X509Certificate issuer, final X509Certificate certificate) throws OCSPException, GeneralSecurityException, IOException, OperatorCreationException, InterruptedException {
+        final OCSPReq ocspRequest = generateOCSPRequest(issuer, certificate);
+        final OCSPResp ocspResp = sendOCSPRequest(OCSP_RESPONDER_URL, ocspRequest.getEncoded());
 
-        final TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(KEY_MANAGER_ALGORITHM, JSSE_PROVIDER);
-        trustManagerFactory.init(trustStore);
-
-        final SSLContext sslContext = SSLContext.getInstance(SSL_CONTEXT_ALGORITHM, JSSE_PROVIDER);
-        sslContext.init(null, trustManagerFactory.getTrustManagers(), null);
-
-        return HttpClient.newBuilder()
-                .sslContext(sslContext)
-                .version(HttpClient.Version.HTTP_1_1)
-                .build();
-    }
-
-
-    public static KeyStore loadKeyStoreFromFile(String filename, String password, File basePath)
-            throws KeyStoreException, NoSuchAlgorithmException, CertificateException, IOException {
-        if (filename == null || filename.isEmpty()) {
+        // Check the response status
+        if (ocspResp.getStatus() != OCSPRespBuilder.SUCCESSFUL) {
+            System.err.println("OCSP response is not successful: " + ocspResp.getStatus());
             return null;
         }
 
-        File sslCertFile = new File(filename);
-        if (!sslCertFile.isAbsolute()) {
-            sslCertFile = new File(basePath, filename);
-        }
-        sslCertFile = sslCertFile.getAbsoluteFile();
-
-        KeyStore ks = KeyStore.getInstance(KEYSTORE_FORMAT);
-        try (FileInputStream in = new FileInputStream(sslCertFile)) {
-            ks.load(in, password.trim().toCharArray());
-        }
-
-        return ks;
+        final BasicOCSPResp basicResponse = (BasicOCSPResp) ocspResp.getResponseObject();
+        return basicResponse.getEncoded(); // Return the DER-encoded OCSP response
     }
 }
