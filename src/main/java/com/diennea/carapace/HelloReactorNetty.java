@@ -13,14 +13,12 @@
 
 package com.diennea.carapace;
 
-import io.netty.handler.codec.http2.Http2SecurityUtil;
-import io.netty.handler.ssl.ApplicationProtocolConfig;
-import io.netty.handler.ssl.ApplicationProtocolNames;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslProvider;
-import io.netty.handler.ssl.SupportedCipherSuiteFilter;
 import java.io.ByteArrayInputStream;
+import java.io.FileOutputStream;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.security.KeyPair;
@@ -57,6 +55,7 @@ import org.bouncycastle.cert.bc.BcX509ExtensionUtils;
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.jsse.provider.BouncyCastleJsseProvider;
+import org.bouncycastle.openssl.jcajce.JcaPEMWriter;
 import org.bouncycastle.operator.ContentSigner;
 import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
@@ -92,6 +91,10 @@ public class HelloReactorNetty {
         final KeyPair keyPair = getKeyPair();
         final X500Name x500subject = getSubject();
         final X509Certificate x509Cert = getSelfSignedCert(keyPair, x500subject);
+
+        writePemFile("ca.key", keyPair.getPrivate());
+        writePemFile("certificate.crt", x509Cert);
+
         final TrustManagerFactory trustManagerFactory = getTrustManagerFactory(keyPair, x509Cert);
 
         final SslContext serverSslContext = SslContextBuilder
@@ -235,5 +238,11 @@ public class HelloReactorNetty {
         final TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(TRUST_MANAGER_ALGORITHM, BC_JSSE_PROVIDER);
         trustManagerFactory.init(keyStore);
         return trustManagerFactory;
+    }
+
+    private static void writePemFile(final String filename, final Object object) throws IOException {
+        try (final JcaPEMWriter pemWriter = new JcaPEMWriter(new FileWriter(filename))) {
+            pemWriter.writeObject(object);
+        }
     }
 }
