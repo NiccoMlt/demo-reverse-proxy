@@ -1,30 +1,21 @@
 package com.diennea.carapace;
 
 import io.netty.handler.codec.http.HttpStatusClass;
-import io.netty.handler.ssl.ApplicationProtocolConfig;
-import io.netty.handler.ssl.ApplicationProtocolNames;
-import io.netty.handler.ssl.OpenSsl;
-import io.netty.handler.ssl.ReferenceCountedOpenSslEngine;
-import io.netty.handler.ssl.SslContext;
-import io.netty.handler.ssl.SslContextBuilder;
-import io.netty.handler.ssl.SslProvider;
+import io.netty.handler.ssl.*;
+
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.math.BigInteger;
 import java.net.URI;
+import java.net.URL;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Paths;
-import java.security.GeneralSecurityException;
-import java.security.KeyPair;
-import java.security.KeyPairGenerator;
-import java.security.KeyStore;
-import java.security.NoSuchAlgorithmException;
-import java.security.NoSuchProviderException;
-import java.security.PrivateKey;
-import java.security.SecureRandom;
-import java.security.Security;
+import java.security.*;
 import java.security.cert.CertificateEncodingException;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
@@ -87,6 +78,8 @@ public class Main {
     private static final String SSL_CONTEXT_ALGORITHM = "TLS";
     private static final int OCSP_PORT = 8080;
     private static final URI OCSP_RESPONDER_URL = URI.create("http://" + HOST + ":" + OCSP_PORT + "/ocsp");
+
+    private static final String KEYSTORE_FORMAT = "PKCS12";
 
     static {
         Security.insertProviderAt(new BouncyCastleProvider(), 1);
@@ -318,7 +311,27 @@ public class Main {
                         ApplicationProtocolConfig.Protocol.ALPN,
                         ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
                         ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
-                        ApplicationProtocolNames.HTTP_2
+                        ApplicationProtocolNames.HTTP_2, ApplicationProtocolNames.HTTP_1_1
+                ))
+                .enableOcsp(true)
+                .build();
+
+        URL resource = Main.class.getClassLoader().getResource("ia.p12");
+
+        assert resource != null;
+        final KeyStore keyLocalhost = loadKeyStoreFromFile("ia.p12", "changeit", new File(new File(resource.getPath()).getParent()));
+        KeyManagerFactory keyFactory = new OpenSslCachingX509KeyManagerFactory(KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()));
+        keyFactory.init(keyLocalhost, "changeit".toCharArray());
+
+
+        final SslContext sslContextLocalhost = SslContextBuilder
+                .forServer(keyFactory)
+                .sslProvider(SslProvider.OPENSSL)
+                .applicationProtocolConfig(new ApplicationProtocolConfig(
+                        ApplicationProtocolConfig.Protocol.ALPN,
+                        ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
+                        ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
+                        ApplicationProtocolNames.HTTP_2,ApplicationProtocolNames.HTTP_1_1
                 ))
                 .enableOcsp(true)
                 .build();
@@ -327,7 +340,7 @@ public class Main {
                 .create()
                 .host(HOST)
                 .port(PORT)
-                .protocol(HttpProtocol.H2)
+                .protocol(HttpProtocol.H2, HttpProtocol.HTTP11)
                 .secure(sslContextSpec -> sslContextSpec.sslContext(sslContext).handlerConfigurator(sslHandler -> {
                     if (!(sslHandler.engine() instanceof ReferenceCountedOpenSslEngine engine)) {
                         throw new RuntimeException("Unexpected SSL handler type: " + sslHandler.engine());
@@ -344,7 +357,8 @@ public class Main {
                     } catch (Exception e) {
                         throw new RuntimeException("Failed to set OCSP response: " + e.getMessage(), e);
                     }
-                }))
+                }).addSniMapping("localhost", sslContextSpec1 -> sslContextSpec1.sslContext(sslContextLocalhost))
+                )
                 .metrics(true, Function.identity())
                 .handle((final HttpServerRequest request, final HttpServerResponse response) -> {
                     // we can't check request.protocol() here, it will always be HTTP/1.1 !!!
@@ -427,7 +441,28 @@ public class Main {
 
         return HttpClient.newBuilder()
                 .sslContext(sslContext)
-                .version(HttpClient.Version.HTTP_2)
+                .version(HttpClient.Version.HTTP_1_1)
                 .build();
+    }
+
+
+    public static KeyStore loadKeyStoreFromFile(String filename, String password, File basePath)
+            throws KeyStoreException, NoSuchAlgorithmException, CertificateException, IOException {
+        if (filename == null || filename.isEmpty()) {
+            return null;
+        }
+
+        File sslCertFile = new File(filename);
+        if (!sslCertFile.isAbsolute()) {
+            sslCertFile = new File(basePath, filename);
+        }
+        sslCertFile = sslCertFile.getAbsoluteFile();
+
+        KeyStore ks = KeyStore.getInstance(KEYSTORE_FORMAT);
+        try (FileInputStream in = new FileInputStream(sslCertFile)) {
+            ks.load(in, password.trim().toCharArray());
+        }
+
+        return ks;
     }
 }
