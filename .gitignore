@@ -43,3 +43,4 @@ build/
 *.p12
 *.key
 *.pem
+acert

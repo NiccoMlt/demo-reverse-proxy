@@ -13,11 +13,15 @@
 
 package com.diennea.carapace;
 
+import io.netty.handler.codec.http2.Http2SecurityUtil;
+import io.netty.handler.logging.LogLevel;
+import io.netty.handler.ssl.ApplicationProtocolConfig;
+import io.netty.handler.ssl.ApplicationProtocolNames;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslProvider;
+import io.netty.handler.ssl.SupportedCipherSuiteFilter;
 import java.io.ByteArrayInputStream;
-import java.io.FileOutputStream;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.math.BigInteger;
@@ -53,6 +57,7 @@ import org.bouncycastle.cert.X509CertificateHolder;
 import org.bouncycastle.cert.X509v3CertificateBuilder;
 import org.bouncycastle.cert.bc.BcX509ExtensionUtils;
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
+import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.jsse.provider.BouncyCastleJsseProvider;
 import org.bouncycastle.openssl.jcajce.JcaPEMWriter;
@@ -89,24 +94,22 @@ public class HelloReactorNetty {
         Security.insertProviderAt(BC_JSSE_PROVIDER, 2);
 
         final KeyPair keyPair = getKeyPair();
-        final X500Name x500subject = getSubject();
-        final X509Certificate x509Cert = getSelfSignedCert(keyPair, x500subject);
+        final var contentSigner = new JcaContentSignerBuilder(SIGNATURE_ALGORITHM)
+                .setProvider(BC_PROVIDER)
+                .build(keyPair.getPrivate());
+        final X509Certificate caCertificate = generateCaCertificate(contentSigner, keyPair.getPublic());
 
-        writePemFile("ca.key", keyPair.getPrivate());
-        writePemFile("certificate.crt", x509Cert);
-
-        final TrustManagerFactory trustManagerFactory = getTrustManagerFactory(keyPair, x509Cert);
-
+        final X509Certificate httpsCertificate = generateHttpsCertificate(caCertificate, contentSigner);
         final SslContext serverSslContext = SslContextBuilder
-                .forServer(keyPair.getPrivate(), x509Cert)
+                .forServer(keyPair.getPrivate(), httpsCertificate)
                 .sslProvider(SslProvider.OPENSSL)
-                /* .ciphers(Http2SecurityUtil.CIPHERS, SupportedCipherSuiteFilter.INSTANCE)
+                .ciphers(Http2SecurityUtil.CIPHERS, SupportedCipherSuiteFilter.INSTANCE)
                 .applicationProtocolConfig(new ApplicationProtocolConfig(
                         ApplicationProtocolConfig.Protocol.ALPN,
                         ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
                         ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
                         ApplicationProtocolNames.HTTP_2
-                )) */
+                ))
                 .build();
 
         final HttpServer httpServer = HttpServer
@@ -116,25 +119,40 @@ public class HelloReactorNetty {
                 .secure(sslContextSpec -> sslContextSpec.sslContext(serverSslContext))
                 .protocol(HttpProtocol.H2)
                 .metrics(true, Function.identity())
-                .handle((final HttpServerRequest request, final HttpServerResponse response) -> {
-                    // It always fails here!!!
-                    /* if (HttpVersion.valueOf(request.protocol()).majorVersion() != 2) {
-                        throw new RuntimeException("Unsupported HTTP version: " + request.protocol());
-                    } */
-                    return response.sendString(request.receive().aggregate().asString().map(it -> "Hello! " + it));
-                });
+                .wiretap(HttpServer.class.getName(), LogLevel.INFO)
+                .route(routes -> routes
+                        .get("/", (final HttpServerRequest request, final HttpServerResponse response) -> {
+                            // It always fails here!!!
+                            /* if (HttpVersion.valueOf(request.protocol()).majorVersion() != 2) {
+                                throw new RuntimeException("Unsupported HTTP version: " + request.protocol());
+                            } */
+                            System.out.println("Server detected HTTP protocol " + request.protocol());
+                            System.out.println("Server detected HTTP version " + request.version());
+                            return response.sendString(Mono.just("Hello World!"));
+                        })
+                        .post("/", (final HttpServerRequest request, final HttpServerResponse response) -> {
+                            // It always fails here!!!
+                            /* if (HttpVersion.valueOf(request.protocol()).majorVersion() != 2) {
+                                throw new RuntimeException("Unsupported HTTP version: " + request.protocol());
+                            } */
+                            System.out.println("Server detected HTTP protocol " + request.protocol());
+                            System.out.println("Server detected HTTP version " + request.version());
+                            return response.send(request.receive().retain());
+                        })
+                );
         final DisposableServer disposableServer = httpServer.bindNow();
 
+        final TrustManagerFactory trustManagerFactory = getTrustManagerFactory(keyPair, caCertificate);
         final SslContext clientSslContext = SslContextBuilder
                 .forClient()
                 .sslProvider(SslProvider.OPENSSL)
-                /* .ciphers(Http2SecurityUtil.CIPHERS, SupportedCipherSuiteFilter.INSTANCE)
+                .ciphers(Http2SecurityUtil.CIPHERS, SupportedCipherSuiteFilter.INSTANCE)
                 .applicationProtocolConfig(new ApplicationProtocolConfig(
                         ApplicationProtocolConfig.Protocol.ALPN,
                         ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
                         ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
                         ApplicationProtocolNames.HTTP_2
-                )) */
+                ))
                 .trustManager(trustManagerFactory)
                 .build();
 
@@ -151,8 +169,8 @@ public class HelloReactorNetty {
                 .blockOptional()
                 .orElseThrow();
 
-        System.out.println(response.status());
-        System.out.println(response.version());
+        System.out.println("Response status: " + response.status());
+        System.out.println("Response HTTP version: " + response.version());
 
         disposableServer.onDispose().block();
     }
@@ -163,20 +181,8 @@ public class HelloReactorNetty {
         return keyPairGenerator.generateKeyPair();
     }
 
-    private static X500Name getSubject() {
-        return new X500NameBuilder()
-                .addRDN(new AttributeTypeAndValue(BCStyle.CN, new DERUTF8String("Common Name")))
-                .addRDN(new AttributeTypeAndValue(BCStyle.OU, new DERUTF8String("Organisational Unit name")))
-                .addRDN(new AttributeTypeAndValue(BCStyle.O, new DERUTF8String("Organisation")))
-                .addRDN(new AttributeTypeAndValue(BCStyle.L, new DERUTF8String("Locality name")))
-                .addRDN(new AttributeTypeAndValue(BCStyle.ST, new DERUTF8String("State or Province name")))
-                .addRDN(new AttributeTypeAndValue(BCStyle.C, new DERUTF8String("it")))
-                .build();
-    }
-
-    private static X509Certificate getSelfSignedCert(final KeyPair keyPair, final X500Name subject) throws IOException, OperatorCreationException, CertificateException {
-        final PublicKey keyPublic = keyPair.getPublic();
-        final byte[] keyPublicEncoded = keyPublic.getEncoded();
+    private static X509Certificate generateCaCertificate(final ContentSigner contentSigner, final PublicKey publicKey) throws IOException, CertificateException {
+        final byte[] keyPublicEncoded = publicKey.getEncoded();
 
         // Generate the Subject (Public-) Key Identifier
         // See: <https://stackoverflow.com/a/77292916/7907339>
@@ -190,47 +196,68 @@ public class HelloReactorNetty {
             subjectKeyIdentifier = new BcX509ExtensionUtils().createSubjectKeyIdentifier(subjectPublicKeyInfo);
         }
 
+        final X500Name subject = new X500NameBuilder()
+                .addRDN(new AttributeTypeAndValue(BCStyle.CN, new DERUTF8String("Common Name")))
+                .addRDN(new AttributeTypeAndValue(BCStyle.OU, new DERUTF8String("Organisational Unit name")))
+                .addRDN(new AttributeTypeAndValue(BCStyle.O, new DERUTF8String("Organisation")))
+                .addRDN(new AttributeTypeAndValue(BCStyle.L, new DERUTF8String("Locality name")))
+                .addRDN(new AttributeTypeAndValue(BCStyle.ST, new DERUTF8String("State or Province name")))
+                .addRDN(new AttributeTypeAndValue(BCStyle.C, new DERUTF8String("it")))
+                .build();
+
         final ZonedDateTime now = ZonedDateTime.now();
         final X509v3CertificateBuilder certBuilder = new X509v3CertificateBuilder(
-                subject, // the certificate issuer is also the subject of the signature
-                new BigInteger(Long.SIZE, PRNG), // the certificate serial number
-                Date.from(now.toInstant()), // the date before which the certificate is not valid
-                Date.from(now.plusYears(1).toInstant()), // the date after which the certificate is not valid
                 subject,
-                SubjectPublicKeyInfo.getInstance(keyPublicEncoded) // the info structure for the public key
+                generateSerialNumber(),
+                Date.from(now.toInstant()),
+                Date.from(now.plusYears(1).toInstant()),
+                subject,
+                SubjectPublicKeyInfo.getInstance(keyPublicEncoded)
         );
-        final ContentSigner contentSigner = new JcaContentSignerBuilder(SIGNATURE_ALGORITHM)
+        final X509CertificateHolder certHolder = certBuilder
+                .addExtension(Extension.basicConstraints, true, new BasicConstraints(true))
+                .addExtension(Extension.subjectKeyIdentifier, false, subjectKeyIdentifier)
+                .build(contentSigner);
+        final X509Certificate certificate = new JcaX509CertificateConverter()
                 .setProvider(BC_PROVIDER)
-                .build(keyPair.getPrivate());
+                .getCertificate(certHolder);
+        writePemFile("ca.crt", certificate);
+        return certificate;
+    }
+
+    private static BigInteger generateSerialNumber() {
+        return new BigInteger(Long.SIZE, PRNG);
+    }
+
+    private static X509Certificate generateHttpsCertificate(final X509Certificate issuer, final ContentSigner contentSigner) throws IOException, CertificateException {
+        final JcaX509v3CertificateBuilder certBuilder = new JcaX509v3CertificateBuilder(
+                issuer,
+                generateSerialNumber(),
+                issuer.getNotBefore(),
+                issuer.getNotAfter(),
+                new X500NameBuilder().addRDN(BCStyle.CN, new DERUTF8String(LOCALHOST)).build(),
+                issuer.getPublicKey()
+        );
         final X509CertificateHolder certHolder = certBuilder
                 /*
-                 * BasicConstraints instantiated with "CA=true"
-                 * The BasicConstraints Extension is usually marked "critical=true"
-                 */
-                .addExtension(Extension.basicConstraints, true, new BasicConstraints(true))
-                /*
-                 * The Subject Key Identifier extension identifies the public key certified by this certificate.
-                 * This extension provides a way of distinguishing public keys
-                 * if more than one is available for a given subject name.
-                 */
-                .addExtension(Extension.subjectKeyIdentifier, false, subjectKeyIdentifier)
-                /*
-                 * The Subject Alternative Names (SAN) seems also to be required.
+                 * The Subject Alternative Names (SAN) seems to be required.
                  */
                 .addExtension(Extension.subjectAlternativeName, false, new GeneralNames(new GeneralName[]{
                         new GeneralName(GeneralName.dNSName, LOCALHOST),
                         new GeneralName(GeneralName.iPAddress, "127.0.0.1")
                 }))
                 .build(contentSigner);
-        return new JcaX509CertificateConverter().setProvider(BC_PROVIDER).getCertificate(certHolder);
+        final X509Certificate certificate = new JcaX509CertificateConverter()
+                .setProvider(BC_PROVIDER)
+                .getCertificate(certHolder);
+        writePemFile("certificate.crt", certificate);
+        return certificate;
     }
 
-    private static KeyStore getKeyStore(final KeyPair keyPair, final X509Certificate x509Cert) throws KeyStoreException, CertificateException, IOException, NoSuchAlgorithmException {
-        final char[] password = "password".toCharArray();
-        final KeyStore keyStore = KeyStore.getInstance(KEYSTORE_TYPE, BC_PROVIDER);
-        keyStore.load(/* initialize it freshly */ null, password /* for integrity checking */);
-        keyStore.setKeyEntry("alias", keyPair.getPrivate(), password, new X509Certificate[]{x509Cert});
-        return keyStore;
+    private static void writePemFile(final String filename, final X509Certificate certificate) throws IOException {
+        try (final JcaPEMWriter pemWriter = new JcaPEMWriter(new FileWriter(filename))) {
+            pemWriter.writeObject(certificate);
+        }
     }
 
     private static TrustManagerFactory getTrustManagerFactory(final KeyPair keyPair, final X509Certificate x509Cert) throws KeyStoreException, CertificateException, IOException, NoSuchAlgorithmException {
@@ -240,9 +267,11 @@ public class HelloReactorNetty {
         return trustManagerFactory;
     }
 
-    private static void writePemFile(final String filename, final Object object) throws IOException {
-        try (final JcaPEMWriter pemWriter = new JcaPEMWriter(new FileWriter(filename))) {
-            pemWriter.writeObject(object);
-        }
+    private static KeyStore getKeyStore(final KeyPair keyPair, final X509Certificate x509Cert) throws KeyStoreException, CertificateException, IOException, NoSuchAlgorithmException {
+        final char[] password = "password".toCharArray();
+        final KeyStore keyStore = KeyStore.getInstance(KEYSTORE_TYPE, BC_PROVIDER);
+        keyStore.load(null, password);
+        keyStore.setKeyEntry("alias", keyPair.getPrivate(), password, new X509Certificate[]{x509Cert});
+        return keyStore;
     }
 }
