@@ -131,8 +131,8 @@ public class Main {
 
         // ... and generate an HTTPS certificate signed by the CA
         final KeyPair keyPair = generateKeyPair();
-        final X509Certificate httpsCertificate1 = buildHttpsCertificate(rootCa, contentSigner);
-        final X509Certificate httpsCertificate2 = buildHttpsCertificate(rootCa, contentSigner);
+        final X509Certificate httpsCertificate1 = buildHttpsCertificate(keyPair, rootCa, contentSigner);
+        final X509Certificate httpsCertificate2 = buildHttpsCertificate(keyPair, rootCa, contentSigner);
 
         // Save the HTTPS certificate to a file
         saveCertificateToFile(httpsCertificate1, "httpsCertificate1.crt");
@@ -228,7 +228,7 @@ public class Main {
         System.out.println("Saved certificate to " + filename);
     }
 
-    private static X509Certificate buildHttpsCertificate(final X509Certificate rootCa, final ContentSigner contentSigner) throws CertificateException, IOException {
+    private static X509Certificate buildHttpsCertificate(final KeyPair keyPair, final X509Certificate rootCa, final ContentSigner contentSigner) throws CertificateException, IOException {
         final var subject = new X500NameBuilder()
                 .addRDN(BCStyle.CN, new DERUTF8String(HOST))
                 .addRDN(BCStyle.OU, new DERUTF8String("Italy"))
@@ -243,7 +243,7 @@ public class Main {
                 rootCa.getNotBefore(),
                 rootCa.getNotAfter(),
                 subject,
-                rootCa.getPublicKey()
+                keyPair.getPublic()
         );
 
         // Add the AIA extension with the OCSP responder URI
