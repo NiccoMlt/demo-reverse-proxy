@@ -331,8 +331,7 @@ public class Main {
                         ApplicationProtocolConfig.Protocol.ALPN,
                         ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
                         ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
-                        ApplicationProtocolNames.HTTP_2,
-                        ApplicationProtocolNames.HTTP_1_1
+                        ApplicationProtocolNames.HTTP_2
                 ))
                 .enableOcsp(true)
                 .build();
@@ -341,7 +340,7 @@ public class Main {
                 .create()
                 .host(HOST)
                 .port(PORT)
-                .protocol(HttpProtocol.H2, HttpProtocol.HTTP11)
+                .protocol(HttpProtocol.H2)
                 .secure(sslContextSpec -> sslContextSpec
                         .sslContext(sslContext)
                         .handlerConfigurator(getSslHandlerConsumer(issuer, httpsCertificate))
@@ -393,8 +392,7 @@ public class Main {
                         ApplicationProtocolConfig.Protocol.ALPN,
                         ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
                         ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
-                        ApplicationProtocolNames.HTTP_2,
-                        ApplicationProtocolNames.HTTP_1_1
+                        ApplicationProtocolNames.HTTP_2
                 ))
                 .enableOcsp(true)
                 .trustManager(trustManagerFactory)
@@ -403,7 +401,7 @@ public class Main {
         return reactor.netty.http.client.HttpClient
                 .create()
                 .secure(sslContextSpec -> sslContextSpec.sslContext(sslContext))
-                .protocol(HttpProtocol.H2, HttpProtocol.HTTP11);
+                .protocol(HttpProtocol.H2);
     }
 
     private static OCSPReq generateOCSPRequest(final X509Certificate issuerCert, final X509Certificate clientCert) throws GeneralSecurityException, IOException, OperatorCreationException, OCSPException {
