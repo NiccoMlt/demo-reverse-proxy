@@ -67,6 +67,8 @@
         <dependency>
             <groupId>io.netty</groupId>
             <artifactId>netty-resolver-dns-native-macos</artifactId>
+            <version>4.1.114.Final</version>
+            <classifier>${os.detected.classifier}</classifier>
             <scope>runtime</scope>
         </dependency>
         <!-- https://mvnrepository.com/artifact/io.netty/netty-transport-native-epoll -->
@@ -127,6 +129,13 @@
     </dependencies>
 
     <build>
+        <extensions>
+            <extension>
+                <groupId>kr.motd.maven</groupId>
+                <artifactId>os-maven-plugin</artifactId>
+                <version>1.7.0</version>
+            </extension>
+        </extensions>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
