@@ -32,13 +32,9 @@ import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.time.ZonedDateTime;
 import java.util.Date;
-import java.util.List;
 import java.util.function.Consumer;
 import java.util.function.Function;
-import javax.net.ssl.ExtendedSSLSession;
 import javax.net.ssl.KeyManagerFactory;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLSession;
 import javax.net.ssl.TrustManagerFactory;
 import org.bouncycastle.asn1.DERSequence;
 import org.bouncycastle.asn1.DERUTF8String;
@@ -457,14 +453,11 @@ public class Main {
     private static byte[] getOcspResponse(final X509Certificate issuer, final X509Certificate certificate) throws OCSPException, GeneralSecurityException, IOException, OperatorCreationException, InterruptedException {
         final OCSPReq ocspRequest = generateOCSPRequest(issuer, certificate);
         final OCSPResp ocspResp = sendOCSPRequest(OCSP_RESPONDER_URL, ocspRequest.getEncoded());
-
         // Check the response status
         if (ocspResp.getStatus() != OCSPRespBuilder.SUCCESSFUL) {
             System.err.println("OCSP response is not successful: " + ocspResp.getStatus());
             return null;
         }
-
-        final BasicOCSPResp basicResponse = (BasicOCSPResp) ocspResp.getResponseObject();
-        return basicResponse.getEncoded(); // Return the DER-encoded OCSP response
+        return ocspResp.getEncoded(); // Return the DER-encoded OCSP response
     }
 }
