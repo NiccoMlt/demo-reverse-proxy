@@ -160,9 +160,10 @@ public class Main {
 
             final HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
 
-            if (response.version() != HttpClient.Version.HTTP_2) {
+            // see reactor/reactor-netty#3475
+            /* if (response.version() != HttpClient.Version.HTTP_2) {
                 throw new RuntimeException("Server response protocol: " + response.version());
-            }
+            } */
 
             if (!HttpStatusClass.SUCCESS.contains(response.statusCode())) {
                 throw new RuntimeException("Server response: " + response.statusCode());
