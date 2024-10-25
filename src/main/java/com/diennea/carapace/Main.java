@@ -76,6 +76,7 @@ import org.bouncycastle.operator.jcajce.JcaDigestCalculatorProviderBuilder;
 import reactor.core.publisher.Mono;
 import reactor.netty.DisposableServer;
 import reactor.netty.http.HttpProtocol;
+import reactor.netty.http.client.HttpClientResponse;
 import reactor.netty.http.server.HttpServer;
 import reactor.netty.http.server.HttpServerRequest;
 import reactor.netty.http.server.HttpServerResponse;
@@ -152,40 +153,41 @@ public class Main {
 
 //        Mono.when(ocspResponder.onDispose(), server.onDispose()).block();
 
-        try (final HttpClient client = setupHttpClient(rootCa)) {
-            final HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create("https://" + HOST + ":" + PORT))
-                    .GET()
-                    .build();
+        final reactor.netty.http.client.HttpClient client = setupHttpClient(rootCa);
+        final HttpClientResponse response = client
+                .host(HOST)
+                .port(PORT)
+                .get()
+                .response()
+                .blockOptional()
+                .orElseThrow();
 
-            final HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-
-            // see reactor/reactor-netty#3475
+        // see reactor/reactor-netty#3475
             /* if (response.version() != HttpClient.Version.HTTP_2) {
                 throw new RuntimeException("Server response protocol: " + response.version());
             } */
 
-            if (!HttpStatusClass.SUCCESS.contains(response.statusCode())) {
-                throw new RuntimeException("Server response: " + response.statusCode());
-            }
-
-            final SSLSession sslSession = response.sslSession().orElseThrow();
-            if (!(sslSession instanceof ExtendedSSLSession extendedSSLSession)) {
-                throw new RuntimeException("SSL Session of unexpected type: " + sslSession);
-            }
-
-            // The OCSP response is encoded using the Distinguished Encoding Rules (DER) in a format described by the ASN.1 found in RFC 6960
-            final List<byte[]> statusResponses = extendedSSLSession.getStatusResponses();
-            if (statusResponses == null || statusResponses.isEmpty()) {
-                throw new RuntimeException("OCSP response missing.");
-            } else {
-                System.out.println("Received OCSP responses: " + statusResponses.size());
-            }
-
-            System.out.println("Server response: " + response.body());
-
-            server.disposeNow();
+        if (!HttpStatusClass.SUCCESS.contains(response.status().code())) {
+            throw new RuntimeException("Server response: " + response.status().code());
         }
+
+        /* final SSLSession sslSession = response.sslSession().orElseThrow();
+        if (!(sslSession instanceof ExtendedSSLSession extendedSSLSession)) {
+            throw new RuntimeException("SSL Session of unexpected type: " + sslSession);
+        }
+
+        // The OCSP response is encoded using the Distinguished Encoding Rules (DER) in a format described by the ASN.1 found in RFC 6960
+        final List<byte[]> statusResponses = extendedSSLSession.getStatusResponses();
+        if (statusResponses == null || statusResponses.isEmpty()) {
+            throw new RuntimeException("OCSP response missing.");
+        } else {
+            System.out.println("Received OCSP responses: " + statusResponses.size());
+        }
+
+        System.out.println("Server response: " + response.body()); */
+        System.out.println("Server response: " + response);
+
+        server.disposeNow();
     }
 
     private static KeyPair generateKeyPair() throws NoSuchAlgorithmException, NoSuchProviderException {
@@ -323,27 +325,11 @@ public class Main {
         keyStore.setKeyEntry("httpsCert", privateKey, null, new X509Certificate[]{httpsCertificate});
         keyStore.setKeyEntry("altHttpsCert", privateKey, null, new X509Certificate[]{httpsCertificateSni});
 
-        final KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KEY_MANAGER_ALGORITHM, BC_JSSE_PROVIDER);
+        final KeyManagerFactory keyManagerFactory = new OpenSslCachingX509KeyManagerFactory(KeyManagerFactory.getInstance(KEY_MANAGER_ALGORITHM, BC_JSSE_PROVIDER));
         keyManagerFactory.init(keyStore, null);
 
         final SslContext sslContext = SslContextBuilder
                 .forServer(keyManagerFactory)
-                .sslProvider(SslProvider.OPENSSL)
-                .applicationProtocolConfig(new ApplicationProtocolConfig(
-                        ApplicationProtocolConfig.Protocol.ALPN,
-                        ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
-                        ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
-                        ApplicationProtocolNames.HTTP_2,
-                        ApplicationProtocolNames.HTTP_1_1
-                ))
-                .enableOcsp(true)
-                .build();
-
-        final KeyManagerFactory keyFactory = new OpenSslCachingX509KeyManagerFactory(KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()));
-        keyFactory.init(keyStore, null);
-
-        final SslContext sslContextLocalhost = SslContextBuilder
-                .forServer(keyFactory)
                 .sslProvider(SslProvider.OPENSSL)
                 .applicationProtocolConfig(new ApplicationProtocolConfig(
                         ApplicationProtocolConfig.Protocol.ALPN,
@@ -364,7 +350,7 @@ public class Main {
                         .sslContext(sslContext)
                         .handlerConfigurator(getSslHandlerConsumer(issuer, httpsCertificate))
                         .addSniMapping("localhost", sslContextSpec1 -> sslContextSpec1
-                                .sslContext(sslContextLocalhost)
+                                .sslContext(sslContext)
                                 .handlerConfigurator(getSslHandlerConsumer(issuer, httpsCertificateSni)))
                 )
                 .metrics(true, Function.identity())
@@ -398,20 +384,30 @@ public class Main {
         };
     }
 
-    private static HttpClient setupHttpClient(final X509Certificate rootCa) throws GeneralSecurityException, IOException {
+    private static reactor.netty.http.client.HttpClient setupHttpClient(final X509Certificate rootCa) throws GeneralSecurityException, IOException {
         final KeyStore trustStore = loadKeyStore();
         trustStore.setCertificateEntry("rootCA", rootCa);
 
         final TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(KEY_MANAGER_ALGORITHM, BC_JSSE_PROVIDER);
         trustManagerFactory.init(trustStore);
 
-        final SSLContext sslContext = SSLContext.getInstance(SSL_CONTEXT_ALGORITHM, BC_JSSE_PROVIDER);
-        sslContext.init(null, trustManagerFactory.getTrustManagers(), null);
-
-        return HttpClient.newBuilder()
-                .sslContext(sslContext)
-                .version(HttpClient.Version.HTTP_1_1)
+        final SslContext sslContext = SslContextBuilder.forClient()
+                .sslProvider(SslProvider.OPENSSL)
+                .applicationProtocolConfig(new ApplicationProtocolConfig(
+                        ApplicationProtocolConfig.Protocol.ALPN,
+                        ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,
+                        ApplicationProtocolConfig.SelectedListenerFailureBehavior.ACCEPT,
+                        ApplicationProtocolNames.HTTP_2,
+                        ApplicationProtocolNames.HTTP_1_1
+                ))
+                .enableOcsp(true)
+                .trustManager(trustManagerFactory)
                 .build();
+
+        return reactor.netty.http.client.HttpClient
+                .create()
+                .secure(sslContextSpec -> sslContextSpec.sslContext(sslContext))
+                .protocol(HttpProtocol.H2, HttpProtocol.HTTP11);
     }
 
     private static OCSPReq generateOCSPRequest(final X509Certificate issuerCert, final X509Certificate clientCert) throws GeneralSecurityException, IOException, OperatorCreationException, OCSPException {
