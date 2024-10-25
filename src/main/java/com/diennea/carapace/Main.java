@@ -14,7 +14,6 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.net.URI;
-import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.security.GeneralSecurityException;
@@ -28,16 +27,23 @@ import java.security.Provider;
 import java.security.PublicKey;
 import java.security.SecureRandom;
 import java.security.Security;
+import java.security.cert.Certificate;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.time.ZonedDateTime;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLSession;
 import javax.net.ssl.TrustManagerFactory;
 import org.bouncycastle.asn1.DERSequence;
 import org.bouncycastle.asn1.DERUTF8String;
+import org.bouncycastle.asn1.ocsp.OCSPResponseStatus;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x500.X500NameBuilder;
 import org.bouncycastle.asn1.x500.style.BCStyle;
@@ -61,6 +67,7 @@ import org.bouncycastle.cert.ocsp.OCSPReqBuilder;
 import org.bouncycastle.cert.ocsp.OCSPResp;
 import org.bouncycastle.cert.ocsp.OCSPRespBuilder;
 import org.bouncycastle.cert.ocsp.RevokedStatus;
+import org.bouncycastle.cert.ocsp.SingleResp;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.jsse.provider.BouncyCastleJsseProvider;
 import org.bouncycastle.openssl.jcajce.JcaPEMWriter;
@@ -70,8 +77,11 @@ import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.bouncycastle.operator.jcajce.JcaDigestCalculatorProviderBuilder;
 import reactor.core.publisher.Mono;
+import reactor.netty.Connection;
 import reactor.netty.DisposableServer;
 import reactor.netty.http.HttpProtocol;
+import reactor.netty.http.client.HttpClient;
+import reactor.netty.http.client.HttpClientRequest;
 import reactor.netty.http.client.HttpClientResponse;
 import reactor.netty.http.server.HttpServer;
 import reactor.netty.http.server.HttpServerRequest;
@@ -91,7 +101,6 @@ public class Main {
     private static final String KEY_MANAGER_ALGORITHM = "PKIX";
     private static final String HASH_ALGORITHM = "SHA256";
     private static final String CERT_ALGORITHM = HASH_ALGORITHM + "with" + KEY_ALGORITHM;
-    private static final String SSL_CONTEXT_ALGORITHM = "TLS";
     private static final int OCSP_PORT = 8080;
     private static final URI OCSP_RESPONDER_URL = URI.create("http://" + HOST + ":" + OCSP_PORT + "/ocsp");
 
@@ -141,15 +150,59 @@ public class Main {
         verifyCertificateWithOCSP(rootCa, httpsCertificate1);
         verifyCertificateWithOCSP(rootCa, httpsCertificate2);
 
-//        ocspResponder.onDispose().block();
-
         final DisposableServer server = setupHttpServer(rootCa, rootKeyPair.getPrivate(), httpsCertificate1, httpsCertificate2);
-
-//        server.onDispose().block();
 
 //        Mono.when(ocspResponder.onDispose(), server.onDispose()).block();
 
-        final reactor.netty.http.client.HttpClient client = setupHttpClient(rootCa);
+        // final Map<BigInteger, X509Certificate> certificates = new HashMap<>();
+        final HttpClient client = setupHttpClient(rootCa)
+                .doOnConnected((final Connection connection) -> {
+                    final SslHandler sslHandler = connection.channel().pipeline().get(SslHandler.class);
+                    if (sslHandler != null) {
+                        sslHandler.handshakeFuture().addListener(future -> {
+                            if (!future.isSuccess()) {
+                                throw new RuntimeException(future.cause());
+                            }
+                            final SSLSession session = sslHandler.engine().getSession();
+                            final Certificate[] chain = session.getPeerCertificates();
+
+                            if (chain.length != 1 || !(chain[0] instanceof X509Certificate x509Certificate)) {
+                                throw new RuntimeException("Unexpected certificate chain");
+                            }
+                            final BigInteger certSerial = x509Certificate.getSerialNumber();
+
+                            if (!(sslHandler.engine() instanceof ReferenceCountedOpenSslEngine engine)) {
+                                throw new RuntimeException("Unexpected SSL engine " + sslHandler.engine().getClass());
+                            }
+
+                            final byte[] staple = engine.getOcspResponse();
+                            if (staple == null) {
+                                throw new IllegalStateException("Server didn't provide an OCSP staple!");
+                            }
+
+                            final OCSPResp response = new OCSPResp(staple);
+                            if (response.getStatus() != OCSPResponseStatus.SUCCESSFUL) {
+                                throw new RuntimeException("Unexpected OCSP response: " + response.getStatus());
+                            }
+
+                            final BasicOCSPResp basicResponse = (BasicOCSPResp) response.getResponseObject();
+                            final SingleResp first = basicResponse.getResponses()[0];
+
+                            // ATTENTION: CertificateStatus.GOOD is actually a null value!
+                            // Do not use equals() or you'll NPE!
+                            final CertificateStatus status = first.getCertStatus();
+                            final BigInteger ocspSerial = first.getCertID().getSerialNumber();
+                            final String message = "OCSP status of " + connection.channel().remoteAddress()
+                                                   + "\n  Status: " + (status == CertificateStatus.GOOD ? "Good" : status)
+                                                   + "\n  This Update: " + first.getThisUpdate()
+                                                   + "\n  Next Update: " + first.getNextUpdate()
+                                                   + "\n  Cert Serial: " + certSerial
+                                                   + "\n  OCSP Serial: " + ocspSerial;
+                            System.out.println(message);
+                        });
+                    }
+                });
+
         final HttpClientResponse response = client
                 .host(HOST)
                 .port(PORT)
@@ -158,31 +211,13 @@ public class Main {
                 .blockOptional()
                 .orElseThrow();
 
-        // see reactor/reactor-netty#3475
-            /* if (response.version() != HttpClient.Version.HTTP_2) {
-                throw new RuntimeException("Server response protocol: " + response.version());
-            } */
-
         if (!HttpStatusClass.SUCCESS.contains(response.status().code())) {
             throw new RuntimeException("Server response: " + response.status().code());
         }
 
-        /* final SSLSession sslSession = response.sslSession().orElseThrow();
-        if (!(sslSession instanceof ExtendedSSLSession extendedSSLSession)) {
-            throw new RuntimeException("SSL Session of unexpected type: " + sslSession);
-        }
-
-        // The OCSP response is encoded using the Distinguished Encoding Rules (DER) in a format described by the ASN.1 found in RFC 6960
-        final List<byte[]> statusResponses = extendedSSLSession.getStatusResponses();
-        if (statusResponses == null || statusResponses.isEmpty()) {
-            throw new RuntimeException("OCSP response missing.");
-        } else {
-            System.out.println("Received OCSP responses: " + statusResponses.size());
-        }
-
-        System.out.println("Server response: " + response.body()); */
         System.out.println("Server response: " + response);
 
+        ocspResponder.disposeNow();
         server.disposeNow();
     }
 
@@ -359,27 +394,7 @@ public class Main {
         return httpServer.bindNow();
     }
 
-    private static Consumer<SslHandler> getSslHandlerConsumer(final X509Certificate issuer, final X509Certificate httpsCertificateSni) {
-        return sslHandler -> {
-            if (!(sslHandler.engine() instanceof ReferenceCountedOpenSslEngine engine)) {
-                throw new RuntimeException("Unexpected SSL handler type: " + sslHandler.engine());
-            }
-
-            // Attempt to retrieve and set the OCSP response here
-            try {
-                final byte[] ocspResponse = getOcspResponse(issuer, httpsCertificateSni);
-                if (ocspResponse != null) {
-                    engine.setOcspResponse(ocspResponse);
-                } else {
-                    System.err.println("Failed to retrieve OCSP response. It is null.");
-                }
-            } catch (Exception e) {
-                throw new RuntimeException("Failed to set OCSP response: " + e.getMessage(), e);
-            }
-        };
-    }
-
-    private static reactor.netty.http.client.HttpClient setupHttpClient(final X509Certificate rootCa) throws GeneralSecurityException, IOException {
+    private static HttpClient setupHttpClient(final X509Certificate rootCa) throws GeneralSecurityException, IOException {
         final KeyStore trustStore = loadKeyStore();
         trustStore.setCertificateEntry("rootCA", rootCa);
 
@@ -397,8 +412,7 @@ public class Main {
                 .enableOcsp(true)
                 .trustManager(trustManagerFactory)
                 .build();
-
-        return reactor.netty.http.client.HttpClient
+        return HttpClient
                 .create()
                 .secure(sslContextSpec -> sslContextSpec.sslContext(sslContext))
                 .protocol(HttpProtocol.H2);
@@ -414,7 +428,7 @@ public class Main {
     }
 
     private static OCSPResp sendOCSPRequest(final URI ocspUri, final byte[] ocspRequestBytes) throws IOException, InterruptedException {
-        try (final HttpClient httpClient = HttpClient.newHttpClient()) {
+        try (final java.net.http.HttpClient httpClient = java.net.http.HttpClient.newHttpClient()) {
             final HttpRequest request = HttpRequest.newBuilder()
                     .uri(ocspUri)
                     .header("Content-Type", "application/ocsp-request")
@@ -446,6 +460,26 @@ public class Main {
         final KeyStore keyStore = KeyStore.getInstance(KEYSTORE_TYPE, BC_PROVIDER);
         keyStore.load(null, null);
         return keyStore;
+    }
+
+    private static Consumer<SslHandler> getSslHandlerConsumer(final X509Certificate issuer, final X509Certificate httpsCertificateSni) {
+        return sslHandler -> {
+            if (!(sslHandler.engine() instanceof ReferenceCountedOpenSslEngine engine)) {
+                throw new RuntimeException("Unexpected SSL handler type: " + sslHandler.engine());
+            }
+
+            // Attempt to retrieve and set the OCSP response here
+            try {
+                final byte[] ocspResponse = getOcspResponse(issuer, httpsCertificateSni);
+                if (ocspResponse != null) {
+                    engine.setOcspResponse(ocspResponse);
+                } else {
+                    System.err.println("Failed to retrieve OCSP response. It is null.");
+                }
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to set OCSP response: " + e.getMessage(), e);
+            }
+        };
     }
 
     private static byte[] getOcspResponse(final X509Certificate issuer, final X509Certificate certificate) throws OCSPException, GeneralSecurityException, IOException, OperatorCreationException, InterruptedException {
